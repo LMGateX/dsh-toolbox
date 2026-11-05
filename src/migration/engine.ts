@@ -8,7 +8,7 @@ import { profilePaths, readOptional, withProfileLock, writePrivate } from './sto
 import type { Decision, Discovery, Distribution, MigrationPlan, MigrationReport, ModuleId, NativeMigrationHost, Values } from './types.ts';
 
 interface Step { kind: 'target' | 'disable' | 'bundles'; before: string; after: string; done: boolean }
-interface Journal { schemaVersion: 1; operationId: string; profileId: string; targetRowId: string; runtimeObserved?: boolean; browserReloadAfter?: number; origin: string; phase: 'prepared' | 'saved'; plan: MigrationPlan; steps: Step[]; backup: string; previous: Partial<Record<ModuleId, unknown>>; rollback?: Partial<Record<ModuleId, { origin: string; done: boolean }>>; recoveryWrites?: { patchBefore: string; patchAfter: string; manifestBefore: string; manifestAfter: string } }
+interface Journal { schemaVersion: 1; operationId: string; profileId: string; targetRowId: string; runtimeObserved?: boolean; browserFenceFinalized?: boolean; browserReloadAfter?: number; origin: string; phase: 'prepared' | 'saved'; plan: MigrationPlan; steps: Step[]; backup: string; previous: Partial<Record<ModuleId, unknown>>; rollback?: Partial<Record<ModuleId, { origin: string; done: boolean }>>; recoveryWrites?: { patchBefore: string; patchAfter: string; manifestBefore: string; manifestAfter: string } }
 /** Stable across HMR but different after a genuine process restart, without process-global state. */
 const processOrigin = () => process.pid + ':' + performance.timeOrigin;
 const document = (text: string) => {
@@ -98,13 +98,15 @@ export function reportJournal(host: NativeMigrationHost, journal: Journal, curre
     if (journal.recoveryWrites) { modules[id] = { phase: 'prepared', ready: false, enabled: false, reason: 'recovery write replay requires explicit retry' }; continue; }
     if (journal.rollback?.[id]) { modules[id] = { phase: journal.rollback[id]!.done ? 'rolled-back' : 'restart-required', enabled: false, ready: false, reason: journal.rollback[id]!.done ? 'selectively restored legacy settings' : 'restart host, then repeat rollback to restore old ownership' }; continue; }
     const enabled = current?.explicit[id]?.enabled === undefined ? decision.enabled : current.explicit[id]!.enabled === true;
-    if (current?.peers[id]?.length || current?.moduleProblems?.[id]?.length || current?.problems.length) { modules[id] = { phase: 'conflict', ready: false, enabled, reason: 'current profile ownership changed; inspect before retry' }; continue; }
+    if (current?.peers[id]?.length || current?.moduleProblems?.[id]?.length || current?.sources.some(source => source.moduleId === id && !!source.problem) || current?.problems.length) { modules[id] = { phase: 'conflict', ready: false, enabled, reason: 'current profile ownership changed; inspect before retry' }; continue; }
     if (!decision.source && current?.sources.some(source => source.moduleId === id && !source.disabled)) { modules[id] = { phase: 'conflict', ready: false, enabled, reason: 'new legacy ownership was added after migration' }; continue; }
     if (decision.phase === 'conflict') { modules[id] = { phase: 'conflict', ready: false, enabled: false, reason: decision.reason }; continue; }
     if (journal.phase !== 'saved') { modules[id] = { phase: 'prepared', ready: false, enabled, reason: 'migration interrupted; retry validates durable steps' }; continue; }
     if (decision.source && !runningConfigMatches(host, journal, decision, current)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'running Toolbox configuration has not adopted imported settings' }; continue; }
+    if (decision.source && journal.origin === processOrigin() && !host.handoverAcknowledged?.(id, decision.source)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'native post-disposal configuration acknowledgment required' }; continue; }
+    if (decision.source && journal.origin !== processOrigin() && journal.runtimeObserved && !originExited(journal.origin)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'original profile host is still alive or cannot be verified stopped' }; continue; }
     if (decision.source && liveLegacy(host, decision)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'legacy runtime has not stopped' }; continue; }
-    if (decision.source && id === 'chime' && journal.origin === processOrigin()) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'fresh host and page required to discard legacy audio work' }; continue; }
+    if (decision.source && id === 'chime' && (!journal.browserFenceFinalized || journal.origin === processOrigin())) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'fresh host and page required to discard legacy audio work' }; continue; }
     if (decision.source && host.get?.('hmr') === undefined && journal.origin === processOrigin()) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'no native reload acknowledgment; restart required' }; continue; }
     modules[id] = { phase: decision.source ? 'applied' : 'fresh', ready: true, enabled };
   }
@@ -118,7 +120,15 @@ export async function runMigration(host: NativeMigrationHost, target: Distributi
     const input = await inspectMigration(host, target);
     let journal = await loadJournal(host, target);
     if (journal && journal.profileId !== input.profileId) throw new Error('journal belongs to another profile');
-    if (journal?.phase === 'saved') return reportJournal(host, journal, input);
+    if (journal?.phase === 'saved') {
+      // Finalize the page fence only on a genuinely fresh host, never a page opened during the old handover.
+      if (journal.browserReloadAfter && !journal.browserFenceFinalized && performance.timeOrigin >= journal.browserReloadAfter && [...host.loader.entries()].some(entry => entry.options.id === target.rowId && !!entry.fiber) && (!journal.runtimeObserved || originExited(journal.origin))) {
+        journal.browserReloadAfter = performance.timeOrigin;
+        journal.browserFenceFinalized = true;
+        await writePrivate(paths.journal, JSON.stringify(journal) + '\n');
+      }
+      return reportJournal(host, journal, input);
+    }
     if (journal && !options.retry) return reportJournal(host, journal, input);
     if (!journal) {
       const plan = planMigration(input);

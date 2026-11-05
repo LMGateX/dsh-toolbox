@@ -6,6 +6,7 @@ import { MODULE_IDS, type Distribution, type ModuleId, type NativeMigrationHost 
 
 /** Explicit locations are mandatory: no ambient-home or live-profile fallback. */
 export async function migrationMain(args = process.argv.slice(2)): Promise<void> {
+  if (args.includes('--help') || args.includes('-h')) { console.log('dsh-toolbox-migrate <inspect|dry-run|apply|retry|rollback> --profile-dir DIR --dsh-home DIR --install-anchor package.json [--distribution NAME] [--operation ID --modules context,retry,chime,goalWait]'); return; }
   const command = args.shift() ?? 'inspect';
   const flags: Record<string, string> = {};
   while (args.length) { const key = args.shift()!; const value = args.shift(); if (!key.startsWith('--') || !value) throw new Error('expected --name value'); flags[key.slice(2)] = value; }

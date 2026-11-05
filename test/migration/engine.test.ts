@@ -31,7 +31,7 @@ async function fixture(work: (f: {host: NativeMigrationHost; dir:string; root:st
   await writeFile(join(dir,'package.json'),JSON.stringify({dependencies:{'dsh-toolbox':'*',...(legacy?{'dsh-stream-retry':'*'}:{})},dsh:{profile:{bundles:['dsh-toolbox',...(legacy?['dsh-stream-retry']:[])]}}}));
   await writeFile(join(dir,'cordis.patch.yml'),'[]\n'.replace('\\n','\n'));
   const entries:LoaderEntry[]=[];
-  const host:NativeMigrationHost={profileContext:{dir,patchPath:join(dir,'cordis.patch.yml'),installAnchor:anchor,home},loader:{entries:()=>entries},get:()=>({})};
+  const host:NativeMigrationHost={profileContext:{dir,patchPath:join(dir,'cordis.patch.yml'),installAnchor:anchor,home},loader:{entries:()=>entries},get:()=>({}),handoverAcknowledged:()=>true};
   try {await work({host,dir,root,entries});} finally {process.env.HOME=oldHome;process.env.DSH_HOME=oldDsh;await rm(root,{recursive:true,force:true});}
 }
 test('pure discovery/dry-run leaves complete profile untouched',async()=>fixture(async({host,dir})=>{
@@ -133,3 +133,20 @@ test('newer target-module edits are never replaced by rollback',async()=>fixture
   await writeFile(join(dir,'cordis.patch.yml'),text.replace('retryEmptyResponse: false','retryEmptyResponse: true'));
   await assert.rejects(rollbackMigration(host,target,{operationId:first.operationId,modules:['retry']}),/newer module edit/);
 }));
+test('chime reload timestamp finalizes only after fresh host and remains stable',async()=>fixture(async({host,dir,entries})=>{
+  const pkg=join(dir,'node_modules','dsh-session-chime');await mkdir(pkg,{recursive:true});
+  await writeFile(join(pkg,'package.json'),JSON.stringify({name:'dsh-session-chime',version:'0.6.0',dsh:{bundle:{patch:'./cordis.patch.yml'}}}));
+  await writeFile(join(pkg,'cordis.patch.yml'),JSON.stringify([{insert:[{id:'session-chime',name:'dsh-session-chime'}]}]));
+  const manifest=JSON.parse(await readFile(join(dir,'package.json'),'utf8'));manifest.dependencies['dsh-session-chime']='*';manifest.dsh.profile.bundles.push('dsh-session-chime');await writeFile(join(dir,'package.json'),JSON.stringify(manifest));
+  const first=childRun(host,"const report=await runMigration(host,target);console.log(JSON.stringify(report));") as {browserReloadAfter:number;modules:any};
+  assert.equal(first.modules.chime.ready,false);
+  const discovered=await inspectMigration(host,target);const config=discovered.rows.find(row=>row.id==='dsh-toolbox')!.config;
+  entries.push({id:'include:dsh-toolbox',options:{id:'dsh-toolbox',name:'dsh-toolbox'},fiber:{state:2,effectiveConfig:config}});
+  assert.equal((await runMigration(host,target)).modules.chime?.ready,false,'a process started before migration cannot masquerade as fresh host');
+  const inspectUrl=JSON.stringify(new URL('../../src/migration/discovery.ts',import.meta.url).href);
+  const body="const {inspectMigration}=await import("+inspectUrl+");const input=await inspectMigration(host,target);const config=input.rows.find(row=>row.id==='dsh-toolbox').config;host.moduleConfig=id=>config.modules[id];const report=await runMigration(host,target);console.log(JSON.stringify(report));";
+  const second=childRun(host,body) as {browserReloadAfter:number;modules:any};
+  assert.equal(second.modules.chime.ready,true);assert.ok(second.browserReloadAfter>=first.browserReloadAfter);
+  const third=childRun(host,body) as {browserReloadAfter:number};
+  assert.equal(third.browserReloadAfter,second.browserReloadAfter);
+},false));

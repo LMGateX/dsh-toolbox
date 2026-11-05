@@ -10,6 +10,9 @@ export interface NativeMigrationHost {
   nativeMigration?: { resolveBundleDir(binName: string, packageName: string, installAnchor: string, profileDir: string): string; loadOverlayPatches(binName: string, file: string): unknown[]; composeEntries(layers: unknown[][], warn?: (message: string) => void): Values[] };
   loader: { entries(): Iterable<LoaderEntry> };
   get?(name: string): unknown;
+  on?(event: string, listener: () => void): () => void;
+  /** Native post-reconciliation acknowledgment, never inferred from missing entries. */
+  handoverAcknowledged?(id: ModuleId, source: Source): boolean;
   /** Optional direct view of the running root module configuration (volatile refs unwrapped). */
   moduleConfig?(id: ModuleId): Values | undefined;
   appReady?: { onReady(listener: () => void): () => void };

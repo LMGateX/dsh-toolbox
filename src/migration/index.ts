@@ -14,6 +14,9 @@ export function startAutomaticMigration(host: NativeMigrationHost, options: Boot
   let state: MigrationState = { modules: Object.fromEntries(options.moduleIds.map(id => [id, { phase: 'pending', ready: false, enabled: false }])) };
   const listeners = new Set<(state: MigrationState) => void>();
   let closed = false;
+  let acknowledged: { id: string; name: string; fiber: boolean }[] | undefined;
+  const nativeHost: NativeMigrationHost = Object.create(host) as NativeMigrationHost;
+  nativeHost.handoverAcknowledged = (id, source) => host.handoverAcknowledged?.(id, source) ?? (acknowledged !== undefined && !acknowledged.some(entry => entry.fiber && (entry.name === (source.moduleName ?? source.packageName) || entry.id === source.rowId)));
   let active: Promise<MigrationReport> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let resolve!: (report: MigrationReport) => void;
@@ -31,7 +34,7 @@ export function startAutomaticMigration(host: NativeMigrationHost, options: Boot
   const execute = (retry = false) => {
     if (active) return active;
     active = (options.auto === false ? dryRunMigration(host, options).then(plan => ({ schemaVersion: 1 as const, operationId: '', profileId: plan.profileId, targetRowId: options.rowId,
-      modules: Object.fromEntries(plan.decisions.map(d => [d.moduleId, { phase: d.source ? 'pending' : d.phase, ready: !d.source && d.phase !== 'conflict', enabled: d.enabled, reason: d.source ? 'automatic migration disabled' : d.reason }])), problems: plan.problems })) : runMigration(host, options, { retry }))
+      modules: Object.fromEntries(plan.decisions.map(d => [d.moduleId, { phase: d.source ? 'pending' : d.phase, ready: !d.source && d.phase !== 'conflict', enabled: d.enabled, reason: d.source ? 'automatic migration disabled' : d.reason }])), problems: plan.problems })) : runMigration(nativeHost, options, { retry }))
       .then(publish).catch(() => { host.logger?.warn('Toolbox automatic migration failed closed; inspect and retry'); return publish(failure()); }).finally(() => { active = undefined; });
     return active;
   };
@@ -50,6 +53,11 @@ export function startAutomaticMigration(host: NativeMigrationHost, options: Boot
     }); }, 0);
     timer.unref?.();
   };
+  const unacknowledge = host.on?.('app-boot/config-reload', () => {
+    // Capture synchronously at the native post-disposal event, not after an async file read.
+    acknowledged = [...host.loader.entries()].map(entry => ({ id: entry.options.id, name: entry.options.name, fiber: !!entry.fiber }));
+    if (!closed) void execute();
+  });
   const unready = host.appReady?.onReady(launch);
   if (!host.appReady) launch();
   return {
@@ -65,6 +73,6 @@ export function startAutomaticMigration(host: NativeMigrationHost, options: Boot
       for (const listener of listeners) listener(structuredClone(state));
       return publish(await rollbackMigration(host, options, input));
     },
-    dispose() { closed = true; unready?.(); if (timer) clearTimeout(timer); listeners.clear(); resolve(failure()); },
+    dispose() { closed = true; unready?.(); unacknowledge?.(); if (timer) clearTimeout(timer); listeners.clear(); resolve(failure()); },
   };
 }

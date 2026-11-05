@@ -226,9 +226,9 @@ test('malformed input fails without filesystem writes', async t => {
   const before = await snapshot(f.root); await assert.rejects(inspectMigration(f.host, target)); assert.deepEqual(await snapshot(f.root), before);
 });
 
-test('native helper resolves only from explicit installation; retired bundles and !!js remain read-only', { skip: !process.env.DSH_TEST_INSTALL_ANCHOR }, async t => {
+test('native helper resolves only from explicit installation; retired bundles and !!js remain read-only', async t => {
   const f = await fixture(t);
-  f.host.profileContext.installAnchor = process.env.DSH_TEST_INSTALL_ANCHOR!;
+  f.host.profileContext.installAnchor = process.env.DSH_TEST_INSTALL_ANCHOR ?? createRequire(import.meta.url).resolve('@deepseek-ai/dsh/package.json');
   delete f.host.nativeMigration;
   await f.pkg('dsh-session-chime', '0.6.0', [{ insert: [{ id: 'session-chime', name: 'dsh-session-chime', config: { volume: 0 } }] }], { selected: true });
   await writeFile(f.host.profileContext.patchPath, `- insert:

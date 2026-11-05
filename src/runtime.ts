@@ -51,7 +51,7 @@ export function createToolboxPlugin(distribution: Distribution) {
           if (closed) return;
           const values = moduleConfig(id);
           const handover = migration.modules[id];
-          const enabled = values.enabled !== false && handover?.enabled !== false;
+          const enabled = values.enabled !== false;
           const allowed = handover?.ready === true && enabled;
           const current = scopes.get(id);
           const fingerprint = JSON.stringify(values);
@@ -148,7 +148,7 @@ export function createToolboxPlugin(distribution: Distribution) {
           modules: Object.fromEntries(distribution.moduleIds.map(id => [id, {
             ...state.modules[id], ...statuses[id],
             ready: state.modules[id]?.ready === true && statuses[id]?.phase === 'active',
-            enabled: moduleConfig(id).enabled !== false && state.modules[id]?.enabled !== false,
+            enabled: moduleConfig(id).enabled !== false,
           }])),
           report: state.report,
           browserReloadAfter: state.report?.browserReloadAfter,

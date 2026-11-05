@@ -28,9 +28,9 @@ dsh plugin --profile web add https://github.com/LMGateX/dsh-toolbox/releases/dow
 
 For one capability replace the asset name, e.g. `dsh-toolbox-retry-0.1.0.tgz`. Verify downloads against release SHA256SUMS. The matching DSH runtime must already exist; packages do not install a second host runtime.
 
-Open **Plugins → DSH Toolbox → Configure**. Combined settings have context, retry, chime and goalWait sections. Each module and every original option is independently editable. Status distinguishes active, disabled, missing dependency, migration-pending, conflict and failed. Module changes dispose old effects before mounting updates.
+Open **Plugins → DSH Toolbox → Configure**. Combined settings have context, retry, chime and goalWait sections. Each module and every original option is independently editable. Status distinguishes active, disabled, missing dependency, migration-pending, conflict and failed. Enable/disable joins feature disposal before reactivation. Policy-only changes use validated live snapshots without remounting in-flight retry classifiers or releasing goal holds.
 
-Fresh installs use preserved source defaults. When any legacy plugin is discovered, absent capabilities remain disabled. Explicit Toolbox values win over imports. Missing optional services affect only the corresponding module.
+Fresh installs use preserved source defaults. When any legacy plugin is discovered, absent capabilities begin disabled and can be explicitly enabled later. Explicit Toolbox values win over imports. Missing optional services affect only the corresponding module. In native web presets, context operations follow the selected agent’s isolated native compaction backend and policy; Toolbox does not enable a second global engine or rewrite presets. A preset without a backend returns an explicit unavailable result for that agent.
 
 ## Automatic legacy migration / 自动迁移
 
@@ -53,7 +53,7 @@ dsh-toolbox-migrate retry --profile-dir /absolute/profile --dsh-home /absolute/d
 dsh-toolbox-migrate rollback --operation OPERATION_UUID --modules retry,chime --profile-dir /absolute/profile --dsh-home /absolute/dsh-home --install-anchor /absolute/host-package
 ```
 
-For splits add `--distribution dsh-toolbox-retry` (or the selected split). Rollback restores only migration-owned values that still match its writes and refuses conflicting later edits. Handover back is staged: first gate Toolbox, shut down/restart the original host when instructed, then repeat explicit rollback to restore old selection. Simply disabling Toolbox never silently re-enables legacy plugins. Offline CLI-only journals without observed host identity cannot prove shutdown and fail closed on automatic legacy restoration.
+For splits add `--distribution dsh-toolbox-retry` (or the selected split). Rollback restores only migration-owned values that still match its writes and refuses conflicting later edits. Handover back is staged: first gate Toolbox, stop the currently recorded owning host processes when instructed, then repeat explicit rollback to restore old selection. Every enabled target host registers before activation; restoration waits for its actual process to stop, not merely the process that originally migrated. An offline CLI-created migration with no later runtime owner can also complete recovery after that CLI exits. New overlapping owners or ambiguous edits refuse restoration. Simply disabling Toolbox never silently re-enables legacy plugins. The CLI binary lives in the selected profile’s `node_modules/.bin`; invoke its absolute path if it is not on your PATH.
 
 ## Configuration shape
 
@@ -86,12 +86,13 @@ Splits use this same envelope but expose only their module. `maxHoldMs: 0` means
 
 ```sh
 npm ci --ignore-scripts
+npx playwright install chromium
 npm run check
 npm run pack
 npm run test:artifacts
 ```
 
-Tests resolve the local baseline DSH dev dependency. `DSH_RUNTIME_ROOT` can explicitly select an installed baseline. Native HOME/profile/processes are disposable; no developer live profile is used. Repository docs/SPEC.md and docs/ACCEPTANCE.md define the frozen release gate; docs/VALIDATION.md records executed evidence and limitations.
+Tests resolve the local baseline DSH dev dependency. `DSH_RUNTIME_ROOT` can explicitly select an installed baseline. Native HOME/profile/processes are disposable; no developer live profile is used. The [release specification](<docs/SPEC.md>) and [acceptance matrix](<docs/ACCEPTANCE.md>) define the frozen release gate; [validation evidence](<docs/VALIDATION.md>) records executed results and limitations. `DSH_TOOLBOX_CHROMIUM` may select an existing Chromium executable for isolated tests.
 
 ## Safety boundaries
 

@@ -69,6 +69,9 @@ export async function readPolicy(
     readonly config?: BackendConfigLike;
     readonly constructor?: { readonly name?: string };
   };
+  if (engine === undefined || engine === null) {
+    return { known: false, backend: 'unavailable', invalidReason: 'no compaction backend is available for this agent' };
+  }
   const backend = engine.constructor?.name ?? 'compaction';
   const raw = engine.config;
   if (raw === undefined || raw === null || typeof raw !== 'object') {

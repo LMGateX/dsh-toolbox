@@ -27,6 +27,7 @@ import type { ResolvedConfig } from './config.ts';
 import { COMPACT_TOOL, GUIDANCE, STATUS_TOOL, compactDescription, statusDescription } from './guidance.ts';
 import { pressurePercent, pressureText, readPressure } from './pressure.ts';
 import { readPolicy } from './policy.ts';
+import { contextForAgent } from './scope.ts';
 import { installPtcTimeoutOverride } from './ptc-timeout.ts';
 import { selectNativeRetentionRange } from './manual.ts';
 import { buildStatus, renderStatus } from './status.ts';
@@ -36,7 +37,7 @@ import type { ContextStatus, StatusOptions } from './status.ts';
 export const name = 'toolbox-context';
 
 /** Services the tools cannot work without. */
-export const inject = ['tools', 'compaction', 'tokenMeter', 'systemPrompt', 'llm'];
+export const inject = ['tools', 'tokenMeter', 'systemPrompt', 'llm'];
 
 export { Config, resolveConfig, validateConfig };
 
@@ -371,18 +372,22 @@ function compactTool(ctx: Context, config: ResolvedConfig): ToolDefinition {
         return failed('compact_context must run inside an agent turn');
       }
       if (exec.signal.aborted) exec.signal.throwIfAborted();
-      const outcome = await runAttempts(ctx, agent, exec.signal, config);
+      const scoped = contextForAgent(ctx, agent);
+      if (scoped.compaction === undefined || scoped.compaction === null) {
+        return failed('no compaction backend is available for this agent; select a preset with a native compaction engine');
+      }
+      const outcome = await runAttempts(scoped, agent, exec.signal, config);
       if (outcome.kind === 'retry') {
         return failed('the conversation changed while the summary was being written; try again');
       }
       if (outcome.kind === 'failed') return failed(outcome.reason);
       if (outcome.kind === 'empty') {
-        const percent = contextPercentFor(ctx, agent.session, config.pressureStep);
+        const percent = contextPercentFor(scoped, agent.session, config.pressureStep);
         const detail = percent === undefined ? '' : ` Current estimated context use is ~${String(percent)}%.`;
         return failed(`neither the native pressure policy nor the native retained-tail selector produced a safe compaction: pressure may be below the threshold with no compactable history, or a single retained unit may be too large.${detail} Continue the task; automatic compaction remains governed by the deployment's compaction config.`);
       }
 
-      const percent = contextPercentFor(ctx, agent.session, config.pressureStep);
+      const percent = contextPercentFor(scoped, agent.session, config.pressureStep);
       const result = outcome.result;
       const compactedItems = Array.isArray(result.shadowedSeqs) ? result.shadowedSeqs.length : 0;
       const freedTokens = Number.isFinite(result.shadowedTokenCount) ? Math.max(0, Math.round(result.shadowedTokenCount)) : 0;
@@ -453,7 +458,7 @@ function statusTool(ctx: Context): ToolDefinition {
       }
       if (exec.signal.aborted) exec.signal.throwIfAborted();
       try {
-        return await buildStatus(ctx, agent, parsed, exec.signal);
+        return await buildStatus(contextForAgent(ctx, agent), agent, parsed, exec.signal);
       } catch (error) {
         if (exec.signal.aborted) exec.signal.throwIfAborted();
         return failed(`context status failed: ${errorMessage(error)}`);
@@ -535,7 +540,7 @@ export function apply(ctx: Context, rawConfig: Record<string, unknown> = {}): vo
           const agent = context.agent;
           if (agent === undefined || agent === null) return '';
           if (next.compactTool && !compactVisible(agent)) return '';
-          return pressureText(readPressure(ctx, agent.session, { measure: false, cached: true }), {
+          return pressureText(readPressure(contextForAgent(ctx, agent), agent.session, { measure: false, cached: true }), {
             notifyAtRatio: next.notifyAtRatio,
             pressureStep: next.pressureStep,
           }, next.compactTool);

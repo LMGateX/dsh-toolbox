@@ -1,6 +1,6 @@
 /** Real Cordis/Loader/Connection fixture, with a disposable active profile and no listening socket. */
 import { Context } from '@deepseek-ai/cordis';
-import Loader from '@deepseek-ai/cordis-plugin-loader';
+import Loader, { Group } from '@deepseek-ai/cordis-plugin-loader';
 import { createRequire } from 'node:module';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, resolve, dirname, basename } from 'node:path';
@@ -27,12 +27,14 @@ export async function loaderFixture(t: TestContext, distribution: Distribution, 
   const profile = join(root, 'home', 'profiles', 'isolated');
   const home = join(root, 'home'); await mkdir(profile, { recursive: true });
   const ctx = suppliedContext ?? new Context();
+  ctx.baseUrl = pathToFileURL(requireHost.resolve('@deepseek-ai/dsh/package.json')).href;
   const routes = new Map<string, any>(); const importTable = new Map<string, any>();
   const initial = structuredClone(config);
   const plugin = createToolboxPlugin(distribution);
   importTable.set(distribution.name, plugin);
   class MemoryLoader extends Loader { override import(name: string, stack?: () => string[]) { return importTable.has(name) ? importTable.get(name) : super.import(name, stack); } }
-  const loader = new MemoryLoader(ctx, { baseUrl: pathToFileURL(profile + '/').href });
+  const loader = new MemoryLoader(ctx, { baseUrl: ctx.baseUrl });
+  loader.builtins.group = Group;
   const patchPath = join(profile, 'cordis.patch.yml');
   await writeFile(join(profile, 'package.json'), JSON.stringify({ name: 'isolated-root-profile', private: true, dependencies: {}, dsh: { profile: { bundles: [] } } }));
   const save = async (rows: unknown[]) => writeFile(patchPath, JSON.stringify([{ insert: rows }], null, 2));

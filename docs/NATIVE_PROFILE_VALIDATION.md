@@ -23,11 +23,25 @@ No conversation, model-provider request, or synthetic host service is used. The 
 
 ## Execution record and discovered blockers
 
-Initial native runs successfully installed the combined package and booted the full web application, then passed configuration persistence and all-five-manifest/split-peer composition checks. Subsequent runs strengthened the gate from page exceptions alone to console errors too, revealing a real package-page fallback crash: native configForms methods require their receiver, but the fallback passed getSnapshot/subscribe detached to React. Native slot error boundaries caught the exception, so pageerror alone was insufficient. The strengthened test is deliberately red until rebuilt artifacts contain the binding correction.
+Initial native runs successfully installed the combined package and booted the full web application, then passed configuration persistence and all-five-manifest/split-peer composition checks. Subsequent runs strengthened the gate from page exceptions alone to console errors too, revealing a real package-page fallback crash: native configForms methods require their receiver, but the fallback passed getSnapshot/subscribe detached to React. Native slot error boundaries caught the exception, so pageerror alone was insufficient. A focused receiver-sensitive form regression first reproduced this failure. Stable WeakMap-cached wrappers now preserve both native method receivers; the same unit test passes and the rebuilt packed native browser gate passes with zero console errors or page exceptions.
 
-Native stock web also initially reported context as missing-dependency for compaction while the other three modules were active. Primary host sources explain why: the web layer disables global compaction and native agent presets mount isolated compaction backends. This is an integration contract defect requiring an agent-scoped adapter, not a missing API key. Publication remains blocked until the integration correction and final packed rerun are recorded here.
+Native stock web also initially reported context as missing-dependency for compaction while the other three modules were active. Primary host sources explain why: the web layer disables global compaction and native agent presets mount isolated compaction backends. This is an integration contract defect requiring an agent-scoped adapter, not a missing API key. The receiver-corrected native gate passed with this condition reported truthfully; it does not treat context as active. Publication still awaits the integration correction and a rerun against the final integration tarballs.
 
 The registry intermittently returned ECONNRESET for yaml and schemastery after earlier fresh native installs succeeded. Later exploratory runs copied only an earlier disposable cache/store and still installed new profiles through the real CLI offline. This environmental retry is separate from the two product defects above.
+
+## Receiver-corrected native run
+
+On 2026-11-06, the receiver-corrected worktree built all five distributions, packed them with an explicitly isolated npm HOME/cache, and passed both native tests (26.5 seconds). The complete source browser suite passed 87/87 and strict standalone client/native-test TypeScript checking passed. The combined native application bound the isolated OS-selected port 44161; no active GUI was used. This is an intermediate native client/configuration acceptance result, not a context-agent bridge result.
+
+The tested intermediate tarball checksums were:
+
+```text
+e086782d729a33a07ee6646ba30907650d37c36c152d886d3f7726c15963a289  dsh-toolbox-0.1.0.tgz
+e377730b77f78f096de28e8c5e9afaa85c18f2403600c8601505a9c00980629d  dsh-toolbox-context-0.1.0.tgz
+6aac4d997fc24647b5638ed924488565ed2ba2750d1e632aaf02ea47c14fe63f  dsh-toolbox-retry-0.1.0.tgz
+d6bd188c5824153cc18e7bd0a254191c29771678b178369e705e8d56149aa971  dsh-toolbox-chime-0.1.0.tgz
+d358d3072a076433d093fa4ee7fd40e4a3ca46cb079af1a06ad1806c02efc399  dsh-toolbox-goal-wait-0.1.0.tgz
+```
 
 ## Reproduce
 

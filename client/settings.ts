@@ -158,7 +158,16 @@ export function createSettingsView(
   React: any, descriptor: SettingsDescriptor, chimeEditor?: unknown, status?: SettingsStatusStore,
 ): (props: SettingsProps) => unknown {
   const h = React.createElement;
-  const useSnapshot = (form: ConfigForm) => React.useSyncExternalStore(form.subscribe, form.getSnapshot, form.getSnapshot) as ConfigFormSnapshot;
+  const formCallbacks = new WeakMap<ConfigForm, { subscribe: ConfigForm['subscribe']; getSnapshot: ConfigForm['getSnapshot'] }>();
+  const useSnapshot = (form: ConfigForm): ConfigFormSnapshot => {
+    let callbacks = formCallbacks.get(form);
+    if (!callbacks) {
+      // Native provider forms are class instances; neither method may lose its receiver.
+      callbacks = { subscribe: listener => form.subscribe(listener), getSnapshot: () => form.getSnapshot() };
+      formCallbacks.set(form, callbacks);
+    }
+    return React.useSyncExternalStore(callbacks.subscribe, callbacks.getSnapshot, callbacks.getSnapshot) as ConfigFormSnapshot;
+  };
   const style = { display: 'grid', gap: 12 };
 
   function TextControl({ form, field, label, hint }: { form: ConfigForm; field: TextField; label: string; hint?: string }) {

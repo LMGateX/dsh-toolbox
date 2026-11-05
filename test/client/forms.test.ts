@@ -323,3 +323,29 @@ test('status store overrides metadata and reports missing runtime status honestl
   assert.match(contents(tree), /recovered/);
   render.cleanup();
 });
+
+test('package fallback preserves native form receivers and stable React store callbacks', () => {
+  const listeners = new Set<() => void>();
+  const native: ConfigForm & { state: ConfigFormSnapshot } = {
+    state: { status: 'ready', writable: true, revision: 4, value: { modules: {} } },
+    getSnapshot() { assert.equal(this, native); return this.state; },
+    subscribe(listener) { assert.equal(this, native); listeners.add(listener); return () => { listeners.delete(listener); }; },
+    async mutate() { assert.equal(this, native); return true; },
+  };
+  const render = renderer();
+  const callbacks: { subscribe: Function; read: Function }[] = [];
+  const cleanups: (() => void)[] = [];
+  const React = {
+    ...render.React,
+    useSyncExternalStore(subscribe: (listener: () => void) => () => void, read: () => unknown) {
+      callbacks.push({ subscribe, read }); cleanups.push(subscribe(() => {})); return read();
+    },
+  };
+  const view = createSettingsView(React, { rowId: 'native', packageName: 'native', moduleIds: [] });
+  view({ view: 'page', configForm: native });
+  view({ view: 'page', configForm: native });
+  assert.equal(callbacks[0]!.subscribe, callbacks[2]!.subscribe);
+  assert.equal(callbacks[0]!.read, callbacks[2]!.read);
+  cleanups.forEach(cleanup => cleanup()); render.cleanup();
+  assert.equal(listeners.size, 0);
+});

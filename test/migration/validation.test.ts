@@ -86,7 +86,7 @@ test('prototype-bearing keys, symbols, and non-enumerable fields cannot hide fro
   assert.doesNotThrow(() => validateModuleConfig('context', Object.assign(Object.create(null), { enabled: false })));
 });
 
-test('audited standalone rules match original config-only validators on semantic values', { skip: !process.env.DSH_TEST_LEGACY_ROOT }, async () => {
+if (process.env.DSH_TEST_LEGACY_ROOT) test('audited standalone rules match original config-only validators on semantic values', async () => {
   const root = process.env.DSH_TEST_LEGACY_ROOT!;
   const original = async (name: string) => import(pathToFileURL(join(root, name, 'lib', 'config.js')).href);
   const [context, chime, goal] = await Promise.all([original('dsh-tool-compact-context'), original('dsh-session-chime'), original('dsh-goal-wait-gate')]);
@@ -104,6 +104,10 @@ test('audited standalone rules match original config-only validators on semantic
     context: config => context.validateConfig(context.resolveConfig(config)),
     retry: config => retrySchema(config), chime: config => chime.resolveRowConfig(config), goalWait: config => goal.resolveConfig(config),
   };
+  assertOracleParity(oracles);
+});
+
+function assertOracleParity(oracles: Record<ModuleId, (config: Values) => unknown>) {
   let checked = 0;
   for (const item of cases) {
     if (item.field === 'enabled' && item.id !== 'chime') continue; // Toolbox envelope, not a legacy field.
@@ -119,4 +123,16 @@ test('audited standalone rules match original config-only validators on semantic
     }
   }
   assert.ok(checked > 300, 'substantial original-source boundary parity corpus executed');
+}
+
+test('public migration validation matches all current feature validators without external sources', async () => {
+  const [context, retry, chime, goal] = await Promise.all([
+    import('../../src/modules/context/config.ts'), import('../../src/modules/retry/index.ts'),
+    import('../../src/modules/chime/config.ts'), import('../../src/modules/goal-wait/config.ts'),
+  ]);
+  assertOracleParity({
+    context: config => context.validateConfig(context.resolveConfig(config)),
+    retry: config => retry.Config(config), chime: config => chime.resolveRowConfig(config),
+    goalWait: config => goal.resolveConfig(config),
+  });
 });

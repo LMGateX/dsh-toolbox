@@ -19,7 +19,7 @@ for(const {name,modules} of distributions) test('packed installable distribution
   t.after(async()=>{assert.ok(temp.startsWith(join(root,'.sandbox-consumer-')));await rm(temp,{recursive:true,force:true});});
   await writeFile(join(temp,'package.json'),JSON.stringify({name:'toolbox-clean-consumer',private:true,type:'module'}));
   // Use npm itself, not source imports. Optional host peers must not install a second runtime.
-  execFileSync('npm',['install','--ignore-scripts','--omit=optional','--no-audit','--no-fund',archive],{cwd:temp,stdio:'pipe',timeout:90000});
+  execFileSync('npm',['install','--ignore-scripts','--omit=optional','--no-audit','--no-fund',archive],{cwd:temp,stdio:'pipe',timeout:90000,env:{...process.env,HOME:temp,DSH_HOME:join(temp,'dsh-home'),npm_config_cache:join(temp,'npm-cache')}});
   const packageDir=join(temp,'node_modules',name);
   const pkg=JSON.parse(await readFile(join(packageDir,'package.json'),'utf8'));
   assert.equal(pkg.version,version);assert.equal(pkg.name,name);assert.equal(pkg.private,undefined);

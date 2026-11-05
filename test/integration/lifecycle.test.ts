@@ -1,0 +1,70 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import Schema from '@deepseek-ai/schemastery';
+import * as context from '../../src/modules/context/index.ts';
+import * as retry from '../../src/modules/retry/index.ts';
+import * as chime from '../../src/modules/chime/index.ts';
+import * as goalWait from '../../src/modules/goal-wait/index.ts';
+import type { Distribution } from '../../src/types.ts';
+import { createRuntime } from '../modules/retry/runtime.ts';
+import { loaderFixture, until, pause } from './loader-harness.ts';
+const distribution: Distribution = { name: 'dsh-toolbox', moduleIds: ['context', 'retry', 'chime', 'goalWait'], modulePlugins: { context, retry, chime, goalWait } };
+const off = () => ({ modules: { context: { enabled: false }, retry: { enabled: false }, chime: { enabled: false }, goalWait: { enabled: false } }, migration: { auto: false } });
+
+test('native Loader toggles only selected feature scopes; policy writes retain root and retry child identity', { timeout: 10000 }, async t => {
+  const runtime = await createRuntime({ product: false, retry: false });
+  t.after(() => runtime.dispose());
+  runtime.ctx.reflect.provide('compaction', { compactIfNeeded: async () => null });
+  runtime.ctx.reflect.provide('tokenMeter', { measure: () => ({ nodes: [] }) });
+  const initial = off(); initial.modules.context = { enabled: true };
+  initial.modules.retry = { enabled: true };
+  const f = await loaderFixture(t, distribution, initial, runtime.ctx);
+  const ready = await f.ready();
+  assert.equal(ready.modules.context.phase, 'active'); assert.equal(ready.modules.retry.phase, 'active');
+  assert.equal(ready.modules.chime.phase, 'disabled'); assert.equal(ready.modules.goalWait.phase, 'disabled');
+  const rootFiber = f.entry.fiber;
+  const live = (name: string) => [...runtime.ctx.registry.values()].flatMap((item: any) => item.name === name ? [...item.fibers] : []).filter((fiber: any) => fiber.uid !== null);
+  const retryFiber = live('toolbox-retry')[0];
+  assert.ok(runtime.ctx.tools.get('compact_context'));
+  await f.update({ ...initial, modules: { ...initial.modules, retry: { enabled: true, errorCodes: [], providers: ['custom'], retryEmptyResponse: false } } });
+  await pause();
+  assert.equal(f.entry.fiber, rootFiber, 'volatile write never remounts the owner row');
+  assert.equal(live('toolbox-retry')[0], retryFiber, 'live retry settings keep captured streams owned');
+  await f.update({ ...initial, modules: { ...initial.modules, context: { enabled: false } } });
+  await until(() => f.status(), state => state.modules.context.phase === 'disabled', 'context disabled');
+  assert.equal(runtime.ctx.tools.get('compact_context'), undefined);
+  assert.equal(live('toolbox-context').length, 0);
+  assert.equal(live('toolbox-retry').length, 1);
+  await f.update(initial);
+  await until(() => f.status(), state => state.modules.context.phase === 'active', 'context enabled again');
+  assert.ok(runtime.ctx.tools.get('compact_context'));
+  await f.entry.update({ disabled: true }); await f.loader.await();
+  assert.equal(runtime.ctx.tools.get('compact_context'), undefined);
+  assert.equal(f.routes.has('/toolbox/dsh-toolbox/status'), false);
+});
+
+test('missing feature services isolate that module and later service publication activates it', { timeout: 10000 }, async t => {
+  const f = await loaderFixture(t, distribution, { ...off(), modules: { ...off().modules, retry: { enabled: true }, chime: { enabled: true } } });
+  const state = await f.ready();
+  assert.equal(state.modules.retry.phase, 'missing-dependency');
+  assert.match(state.modules.retry.reason, /llm/);
+  assert.equal(state.modules.chime.phase, 'active');
+  f.ctx.reflect.provide('llm', {});
+  await until(() => f.status(), value => value.modules.retry.phase === 'active', 'retry dependency publication');
+  assert.equal(f.status().modules.chime.phase, 'active');
+});
+
+test('root awaits a feature disposer before activating a later enable of that capability', { timeout: 10000 }, async t => {
+  const events: string[] = []; let release!: () => void;
+  const draining = new Promise<void>(done => { release = done; });
+  const feature = { name: 'root-order-probe', inject: [], Config: Schema.object({}), apply(ctx: any) { events.push('mount'); ctx.effect(() => async () => { events.push('drain-start'); await draining; events.push('drain-end'); }); } };
+  const d: Distribution = { name: 'dsh-toolbox-chime', moduleIds: ['chime'], modulePlugins: { chime: feature } };
+  const f = await loaderFixture(t, d, { modules: { chime: { enabled: true } }, migration: { auto: false } });
+  await f.ready(); assert.deepEqual(events, ['mount']);
+  await f.update({ modules: { chime: { enabled: false } }, migration: { auto: false } });
+  await until(() => events.length, n => n >= 2, 'disposer entered');
+  await f.update({ modules: { chime: { enabled: true } }, migration: { auto: false } });
+  await pause(); assert.deepEqual(events, ['mount', 'drain-start']);
+  release(); await until(() => events.length, n => n >= 4, 'new capability admitted');
+  assert.deepEqual(events.slice(0, 4), ['mount', 'drain-start', 'drain-end', 'mount']);
+});

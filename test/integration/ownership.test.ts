@@ -56,9 +56,9 @@ test('root policy-only goal updates preserve held authority beside the unmodifie
   await f.update({ ...initial, modules: { goalWait: { ...initial.modules.goalWait, waitForJobs: false, waitForSubagents: false } } });
   await until(() => ctx.goals.get(handle.agent).activation, activation => activation === 'armed', 'live policy releases owned hold');
   finish({ status: 'completed' }); await ctx.jobs.wait(jobId, 1000, handle.agent.session.id);
-  assert.equal(ctx.goals.get(handle.agent).phase, 'active');
-  // This assertion is the gate-owned authority boundary. The separately retained
-  // native-host test covers native round completion after job consumption.
+  await until(() => handle.state.requests.length, count => count === baseline + 1, 'native round follows policy release');
+  await handle.agent.whenIdle();
+  assert.equal(ctx.goals.get(handle.agent).roundsStarted, 1);
   assert.ok([...ctx.registry.values()].some((entry: any) => entry.name === 'goal-round-driver'));
 });
 

@@ -20,6 +20,8 @@ test('a captured native stream sees live retry policy, then becomes inert when i
   };
   const captured = await capture();
   await f.update({ ...initial, modules: { retry: { ...initial.modules.retry, errorCodes: ['custom'] } } }); await pause();
+  const saved = runtime.ctx.get('configEditor').configuration().find((row: any) => row.entry.options.id === d.name);
+  assert.deepEqual(saved.override.modules.retry.errorCodes, ['custom'], 'the native editor persisted the live policy');
   captured.release(); const rewritten = await captured.iterator.next();
   assert.equal(rewritten.value.reason.failure.code, 'TRANSPORT');
   const obsolete = await capture();
@@ -54,7 +56,10 @@ test('root policy-only goal updates preserve held authority beside the unmodifie
   assert.equal(ctx.goals.get(handle.agent).roundsStarted, 0);
   assert.equal(handle.state.requests.length, baseline, 'no native reservation slips between policy owners');
   await f.update({ ...initial, modules: { goalWait: { ...initial.modules.goalWait, waitForJobs: false, waitForSubagents: false } } });
-  await until(() => ctx.goals.get(handle.agent).activation, activation => activation === 'armed', 'live policy releases owned hold');
+  // Native ConfigEditor awaits reconciliation; a fast native round may already
+  // have completed and disarmed again. Its durable admission proves the gate
+  // released authority, without sampling that transient armed interval.
+  await until(() => ctx.goals.get(handle.agent).roundsStarted, rounds => rounds === 1, 'live policy releases hold and admits native round');
   finish({ status: 'completed' }); await ctx.jobs.wait(jobId, 1000, handle.agent.session.id);
   await until(() => handle.state.requests.length, count => count === baseline + 1, 'native round follows policy release');
   await handle.agent.whenIdle();
@@ -70,4 +75,6 @@ test('a module saved disabled initially can be enabled by a later native volatil
   assert.equal(f.status().modules.retry.phase, 'disabled');
   await f.update({ ...initial, modules: { retry: { enabled: true } } });
   await until(() => f.status(), state => state.modules.retry.phase === 'active', 'initially disabled module becomes active');
+  const saved = runtime.ctx.get('configEditor').configuration().find((row: any) => row.entry.options.id === d.name);
+  assert.equal(saved.override.modules.retry.enabled, true, 'activation follows the persisted native profile write');
 });

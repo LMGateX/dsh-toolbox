@@ -32,7 +32,14 @@ export async function loaderFixture(t: TestContext, distribution: Distribution, 
   const initial = structuredClone(config);
   const plugin = createToolboxPlugin(distribution);
   importTable.set(distribution.name, plugin);
-  class MemoryLoader extends Loader { override import(name: string, stack?: () => string[]) { return importTable.has(name) ? importTable.get(name) : super.import(name, stack); } }
+  const NativeInclude = (await loadHost('cordis-plugin-include')).default;
+  class FixtureInclude extends NativeInclude {
+    import(name: string, stack?: () => string[]) { return importTable.has(name) ? importTable.get(name) : super.import(name, stack); }
+  }
+  class MemoryLoader extends Loader { override import(name: string, stack?: () => string[]) {
+    if (name === 'cordis:include') return FixtureInclude;
+    return importTable.has(name) ? importTable.get(name) : super.import(name, stack);
+  } }
   const loader = new MemoryLoader(ctx, { baseUrl: ctx.baseUrl });
   loader.builtins.group = Group;
   const patchPath = join(profile, 'cordis.patch.yml');
@@ -59,10 +66,22 @@ export async function loaderFixture(t: TestContext, distribution: Distribution, 
   let closed = false;
   const dispose = async () => { if (closed) return; closed = true; await ctx.fiber.dispose(); if (dirname(root) !== resolve(tmpdir()) || !basename(root).startsWith('toolbox-root-lifecycle-')) throw new Error('unsafe fixture cleanup'); await rm(root, { recursive: true, force: true }); };
   t.after(dispose);
-  const id = await loader.create({ name: distribution.name, config: initial, id: distribution.name } as never);
+  // Native ConfigEditor owns persistence and profile reconciliation. A bare
+  // Loader row has no profile writer and would leave adoption fences comparing
+  // changed in-memory settings against the old persisted profile.
+  const boot = await loadHost('dsh-app-boot');
+  const baseFile = join(profile, 'cordis.yml'); await writeFile(baseFile, '[]\n');
+  await boot.mountRootInclude(ctx, baseFile, boot.readProfilePatches('dsh', ctx.get('profileContext')));
   await loader.await();
-  const entry = loader.resolve(id); const fiber = entry.fiber;
-  const update = async (next: Record<string, any>) => { await entry.update({ config: next }); await loader.await(); };
+  const entry = [...loader.entries()].find(row => row.options.id === distribution.name);
+  if (!entry?.fiber) throw new Error('native Include did not mount the Toolbox row');
+  const fiber = entry.fiber;
+  const update = async (next: Record<string, any>) => {
+    let editor = ctx.get('configEditor') as any;
+    if (editor === undefined) { await ctx.plugin((await loadHost('dsh-config-editor')).default).await(); editor = ctx.get('configEditor'); }
+    await editor.edit(entry, () => structuredClone(next));
+    await loader.await();
+  };
   return { root, profile, home, ctx, loader, entry, fiber, routes, request, status, update, save, importTable, host, ownerCookie, dispose,
     ready: async (ids: readonly ModuleId[] = distribution.moduleIds) => until(() => status(), state => state.report !== undefined && ids.every(id => ['active', 'disabled', 'missing-dependency', 'conflict', 'failed'].includes(state.modules?.[id]?.phase)), 'root module admission') };
 }

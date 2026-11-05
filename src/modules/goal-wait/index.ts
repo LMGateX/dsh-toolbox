@@ -8,6 +8,7 @@
  * the input the official goal-round driver reads at every idle.
  */
 import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-goal'
 import type {} from '@deepseek-ai/dsh-jobs'
@@ -37,6 +38,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     return resolved
   }
   const gate = new GoalWaitGate(ctx, readPolicy)
+  const observed = new Set<Agent>()
+  const evaluate = (agent: Agent) => { observed.add(agent); gate.evaluate(agent) }
+  ;(ctx.on as any)('loader/volatile-update', () => { for (const agent of observed) gate.evaluate(agent) })
   ctx.logger.info(
     `goal-wait-gate: mounted (waitForJobs=${resolved.waitForJobs}, waitForSubagents=${resolved.waitForSubagents}, maxHoldMs=${resolved.maxHoldMs})`,
   )
@@ -44,25 +48,26 @@ export function apply(ctx: Context, config: Config = {}): void {
   // Primary checkpoint: the turn loop awaits this before the agent turns idle,
   // so the goal is already gated when the official driver's idle check runs.
   ctx.on('agent/turn-stopping', ({ agent }) => {
-    gate.evaluate(agent)
+    evaluate(agent)
   })
 
   // Safety net for turn shapes that end without turn-stopping.
   ctx.on('agent/status', ({ agent, status }) => {
     if (status !== 'idle') return
-    gate.evaluate(agent)
+    evaluate(agent)
   }, { prepend: true })
 
   // A goal created, edited, or resumed while live work is already pending must
   // not start an empty round: the official driver turns `goal/changed` into a
   // drive request, so this listener runs before its own.
   ctx.on('goal/changed', ({ agent }) => {
-    gate.evaluate(agent)
+    evaluate(agent)
   }, { prepend: true })
 
   // A disposed agent's session may be resumed later as a fresh agent; the old
   // bookkeeping must not leak into it.
   ctx.on('agent/disposed', ({ agent }) => {
+    observed.delete(agent)
     gate.forget(agent)
   })
 

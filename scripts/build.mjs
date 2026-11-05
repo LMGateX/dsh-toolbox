@@ -22,10 +22,10 @@ for (const { name, modules } of distributions) {
     name, version: source.version, description: name === 'dsh-toolbox' ? source.description : 'DSH Toolbox: ' + modules[0] + ' distribution', type: 'module', license: source.license,
     main: './lib/index.js', exports: {'.': './lib/index.js', './client': './lib/client.js', './migration': './lib/migration.js', './package.json': './package.json'},
     bin: {'dsh-toolbox-migrate': './lib/migrate.js'}, engines: source.engines, repository: source.repository,
-    files: ['lib/', 'cordis.patch.yml', 'README.md', 'LICENSE', 'notices/', 'THIRD_PARTY_NOTICES.md'],
+    files: ['lib/', 'cordis.patch.yml', 'README.md', 'LICENSE', 'notices/', 'assets/', 'THIRD_PARTY_NOTICES.md'],
     peerDependencies: peers, peerDependenciesMeta: Object.fromEntries(Object.keys(peers).map(key => [key,{optional:true}])),
     dependencies: {'@deepseek-ai/schemastery': source.dependencies['@deepseek-ai/schemastery']},
-    dsh: {bundle: {patch: 'cordis.patch.yml'}, client: {platforms:['web'], inject: [...new Set(modules.flatMap(id=>clientDependencies[id]))]}},
+    dsh: {bundle: {patch: 'cordis.patch.yml'}, client: {platform:'web', inject: [...new Set(modules.flatMap(id=>clientDependencies[id]))]}},
   };
   await writeFile(join(out, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
   await copyFile(join(root, 'README.md'), join(out, 'README.md'));
@@ -34,6 +34,7 @@ for (const { name, modules } of distributions) {
   for (const id of modules) await copyFile(join(root, 'src/modules', sourceDirectories[id], 'NOTICE.txt'), join(out, 'notices', id + '.txt'));
   if (hasChime) {
     await copyFile(join(root, 'THIRD_PARTY_NOTICES.md'), join(out, 'THIRD_PARTY_NOTICES.md'));
+    await cp(join(root, 'assets'), join(out, 'assets'), {recursive: true});
     // Source sound data is compiled into chime payload; source licenses remain downloadable.
   }
   console.log('Built ' + name + '@' + source.version + ' [' + modules.join(', ') + ']');

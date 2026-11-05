@@ -1,8 +1,10 @@
 node_modules/
 lib/
 dist/
-artifacts/
+/artifacts/
 .sandbox/
+.sandbox-*
+.sandbox*.log
 coverage/
 *.tgz
 .agents/

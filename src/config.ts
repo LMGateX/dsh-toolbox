@@ -17,7 +17,10 @@ export function createConfig(distribution: Distribution): Schemastery<any> {
     const schema = feature?.Config as Schemastery<any> | undefined;
     if (!schema?.dict) throw new TypeError('Toolbox module has no object configuration schema: ' + id);
     const fields: Record<string, Schemastery<any>> = {};
-    for (const [key, field] of Object.entries(schema.dict)) fields[key] = Schema(field.toJSON()).volatile();
+    for (const [key, field] of Object.entries(schema.dict)) {
+      const cloned = Schema(field.toJSON());
+      fields[key] = cloned.meta.volatile ? cloned : cloned.volatile();
+    }
     fields.enabled = Schema.boolean().default(true).description('Enable this module; disabled modules register no feature effects.').volatile();
     modules[id] = Schema.object(fields).default({});
   }

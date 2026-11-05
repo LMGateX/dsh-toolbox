@@ -16,9 +16,10 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/**/*.test.ts",
+    "test": "node scripts/test.mjs",
     "check": "npm run typecheck && npm test && npm run build",
-    "pack": "node scripts/pack.mjs"
+    "pack": "node scripts/pack.mjs",
+    "test:artifacts": "node scripts/test.mjs artifacts"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "~3.18.4",
@@ -29,6 +30,10 @@
     "typescript": "^5.9.3",
     "esbuild": "^0.25.12",
     "@deepseek-ai/dsh": "0.2.2-alpha.3",
-    "@playwright/test": "^1.56.1"
+    "@playwright/test": "^1.56.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@deepseek-ai/dsh-subagent-spawn-in-process": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-subagent-fork-in-process": "0.2.2-alpha.3"
   }
 }

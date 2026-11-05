@@ -1,11 +1,11 @@
-import type { Context, Fiber, Plugin } from '@deepseek-ai/cordis';
+import { Context, type Fiber, type Plugin } from '@deepseek-ai/cordis';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createConfig, plain, validateModule } from './config.ts';
 import { startAutomaticMigration } from './migration/index.ts';
 import type { MigrationController, NativeMigrationHost } from './migration/types.ts';
 import type { Distribution, ModuleId, ModuleState } from './types.ts';
 
-interface RunningModule { fiber: Fiber; fingerprint: string }
+interface RunningModule { fiber: Fiber; fingerprint: string; values: Record<string, unknown> }
 
 /** One product shell; feature policy stays in independently disposed child fibers. */
 export function createToolboxPlugin(distribution: Distribution) {
@@ -29,6 +29,7 @@ export function createToolboxPlugin(distribution: Distribution) {
         loader: root.loader,
         appReady: get('appReady'),
         get,
+        on: (event: string, listener: (...args: any[]) => void) => (ctx.on as any)(event, listener),
         logger: log,
         moduleConfig,
       } as NativeMigrationHost;
@@ -54,7 +55,7 @@ export function createToolboxPlugin(distribution: Distribution) {
           const allowed = handover?.ready === true && enabled;
           const current = scopes.get(id);
           const fingerprint = JSON.stringify(values);
-          if (current && (!allowed || current.fingerprint !== fingerprint)) {
+          if (current && !allowed) {
             scopes.delete(id);
             await current.fiber.dispose();
             if (closed) return;
@@ -67,13 +68,34 @@ export function createToolboxPlugin(distribution: Distribution) {
             continue;
           }
           const existing = scopes.get(id);
-          if (existing) { setFiberState(id, existing.fiber); continue; }
+          if (existing) {
+            if (existing.fingerprint !== fingerprint) {
+              try {
+                validateModule(distribution, id, values);
+                const changed = Object.keys(values).filter(key => JSON.stringify(existing.values[key]) !== JSON.stringify(values[key]));
+                existing.values = values;
+                existing.fingerprint = fingerprint;
+                const receiver = Object.create(existing.fiber.ctx);
+                receiver[Context.filter] = (owner: Context) => owner.fiber === existing.fiber;
+                (existing.fiber.ctx.emit as any)(receiver, 'loader/volatile-update', changed.map(key => [key]));
+              } catch (error) { log.warn('Module %s rejected a live policy update: %s', id, error); }
+            }
+            setFiberState(id, existing.fiber);
+            continue;
+          }
           try {
             validateModule(distribution, id, values);
             const plugin = distribution.modulePlugins[id];
             if (!plugin) throw new TypeError('Distribution module implementation missing: ' + id);
-            const fiber = ctx.plugin(plugin as Plugin, values);
-            scopes.set(id, {fiber, fingerprint});
+            // Validation belongs to the root form. A stable getter view keeps feature live
+            // policy updates from destroying in-flight retry classifiers or gate-owned holds.
+            const running = {fingerprint, values} as RunningModule;
+            const input: Record<string, unknown> = {};
+            const fields = (plugin.Config as Schemastery<any>).dict ?? {};
+            for (const key of Object.keys(fields)) Object.defineProperty(input, key, {enumerable: true, get: () => running.values[key]});
+            const fiber = ctx.plugin({name: plugin.name, inject: plugin.inject, apply: plugin.apply} as Plugin, input);
+            running.fiber = fiber;
+            scopes.set(id, running);
             setFiberState(id, fiber);
             void fiber.await().then(() => setFiberState(id, fiber), () => setFiberState(id, fiber));
           } catch (error) {

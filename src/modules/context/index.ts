@@ -38,7 +38,7 @@ export const name = 'toolbox-context';
 /** Services the tools cannot work without. */
 export const inject = ['tools', 'compaction', 'tokenMeter', 'systemPrompt', 'llm'];
 
-export { Config, resolveConfig };
+export { Config, resolveConfig, validateConfig };
 
 /** Prompt placement: after the PTC-only instruction (800), before tool guidance (900). */
 const SECTION_ORDER = 850;

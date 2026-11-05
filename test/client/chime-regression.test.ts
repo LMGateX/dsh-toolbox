@@ -1,0 +1,1099 @@
+/**
+ * Browser-half tests. They load the built bundle the way the web shell does — as a
+ * classic script — and drive the exported helpers under a fake clock and a fake
+ * settings form.
+ */
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { createChimeAdapter } from '../../client/chime.ts';
+import type { ConfigForm, ConfigFormSnapshot, PathOperation, SessionListSnapshot } from '../../client/chime-public.ts';
+
+type Reason = 'done' | 'blocked' | 'question' | 'error';
+
+interface ClientApi {
+  apply(ctx: unknown): void;
+  isSettled(input: { running: boolean; liveJobs: number; liveChildren: number; goalPhase: string | null; failed?: boolean }): boolean;
+  createWatcher(deps: Record<string, unknown>): {
+    update(sessions: SessionListSnapshot): void;
+    attachRoster(service: unknown): () => void;
+    attachUiSession(service: unknown): () => void;
+    attachRemote(service: unknown): () => void;
+    reportError(sessionId: string): void;
+  };
+  createEditor(form: ConfigForm): {
+    getSnapshot(): { status: string; writable: boolean; values: Record<string, string | boolean>; dirty: boolean; saving: boolean; error: string; conflict: boolean };
+    subscribe(fn: () => void): () => void;
+    start(): () => void;
+    edit(field: string, value: string | boolean): void;
+    discard(): void;
+    reset(): void;
+    save(): Promise<boolean>;
+  };
+  settingsOf(value: unknown): Record<string, unknown>;
+  parseDuration(text: string): { value?: number; error?: string };
+  parseVolume(text: string): { value?: number; error?: string };
+  parseClock(text: unknown): number | null;
+  inQuietHours(now: Date, start: string, end: string): boolean;
+  effectiveWindowMs(settings: Record<string, unknown>, clipMs: number, now: Date): number;
+  chimeSound(reason: string, settings: Record<string, unknown>, override?: string): string | undefined;
+  checkTime(text: string): string | undefined;
+  shouldStopOnGesture(startedAt: number | undefined, now: number, minRingMs: number): boolean;
+  gestureStopsRing(placement: string, bannerShown: boolean, startedAt: number | undefined, now: number, minRingMs: number): boolean;
+  PLACEMENTS: string[];
+  inject: string[];
+  ROW_ID: string;
+  FIELDS: string[];
+  SOUND_IDS: string[];
+}
+
+/** Shared behavior suite: emitted entry loading has a separate contract suite. */
+function loadClient(): ClientApi {
+  Reflect.set(globalThis, 'window', { addEventListener() {}, removeEventListener() {} });
+  const reactStub = { createElement: () => ({}), useState: (init: () => unknown) => [init(), () => {}], useEffect: () => {}, useSyncExternalStore: (_subscribe: unknown, read: () => unknown) => read() };
+  const api = createChimeAdapter(reactStub as any);
+  return Object.assign(api, { apply(ctx: any) { const dispose = api.mount(ctx, ctx.configForms.get('dsh-toolbox')); ctx.effect(() => dispose, 'chime lifetime'); } }) as unknown as ClientApi;
+}
+
+const client = loadClient();
+
+/** Deterministic clock: the watcher never touches the real one. */
+function fakeClock() {
+  let now = 0;
+  let seq = 0;
+  const timers = new Map<number, { at: number; fn: () => void }>();
+  return {
+    now: () => now,
+    setTimer(fn: () => void, ms: number) {
+      seq += 1;
+      timers.set(seq, { at: now + ms, fn });
+      return seq;
+    },
+    clearTimer(handle: unknown) {
+      timers.delete(handle as number);
+    },
+    advance(ms: number) {
+      now += ms;
+      for (const [id, timer] of [...timers]) {
+        if (timer.at <= now) {
+          timers.delete(id);
+          timer.fn();
+        }
+      }
+    },
+    pending: () => timers.size,
+  };
+}
+
+/** Build a session catalog snapshot from a compact description. */
+function sessionsOf(rows: Record<string, { running?: boolean; parentId?: string; origin?: string; phase?: string | null; title?: string; catalog?: readonly string[] }>): SessionListSnapshot {
+  const ids = Object.keys(rows);
+  const byId: Record<string, Record<string, unknown>> = {};
+  for (const id of ids) {
+    const row = rows[id]!;
+    byId[id] = {
+      id,
+      displayTitle: row.title ?? 'session ' + id,
+      running: row.running === true,
+      ...(row.parentId === undefined ? {} : { parentId: row.parentId }),
+      ...(row.origin === undefined ? {} : { origin: row.origin }),
+      ...(row.phase === undefined && row.catalog === undefined ? {} : {
+        projectionValues: {
+          ...(row.phase === undefined ? {} : { goal: row.phase === null ? null : { goal: { phase: row.phase } } }),
+          // The host-computed direct-child list a parent row carries.
+          ...(row.catalog === undefined ? {} : { subagentCatalog: row.catalog.map(id => ({ id, createdAt: 0 })) }),
+        },
+      }),
+    };
+  }
+  return { ids, byId } as SessionListSnapshot;
+}
+
+/** Controllable stand-in for the optional client job-roster service. */
+function fakeJobs() {
+  const listeners = new Set<() => void>();
+  let rows: Record<string, readonly { status: string; owner?: string }[]> = {};
+  const watched: string[] = [];
+  const released: string[] = [];
+  const service = {
+    state: {
+      getSnapshot: () => ({ rows }),
+      subscribe(listener: () => void) {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
+    watchRows(sessionId: string) {
+      watched.push(sessionId);
+      return () => {
+        released.push(sessionId);
+      };
+    },
+  };
+  return {
+    service, watched, released,
+    /** Publish a complete per-session roster, the way a rows frame does. */
+    set(next: Record<string, readonly { status: string; owner?: string }[]>) {
+      rows = next;
+      for (const listener of [...listeners]) listener();
+    },
+    /** Notify subscribers without moving any roster, the way an output observation does. */
+    poke() {
+      for (const listener of [...listeners]) listener();
+    },
+  };
+}
+
+/** Controllable stand-in for the optional client session UI status source. */
+function fakeUiSession() {
+  const listeners = new Set<() => void>();
+  let snapshot = new Map<string, { pendingInteraction: { key: string; kind: string; sessionId: string } }>();
+  const service = {
+    sessionStatus: {
+      getSnapshot: () => snapshot,
+      subscribe(listener: () => void) {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+    },
+  };
+  return {
+    service, listeners,
+    /** Publish one attention interaction per session; an absent entry clears it. */
+    set(rows: Record<string, { key: string; kind: string } | undefined>) {
+      snapshot = new Map();
+      for (const [sessionId, pending] of Object.entries(rows)) {
+        if (pending === undefined) continue;
+        snapshot.set(sessionId, { pendingInteraction: { sessionId, key: pending.key, kind: pending.kind } });
+      }
+      for (const listener of [...listeners]) listener();
+    },
+  };
+}
+
+/** Controllable stand-in for the optional Remote event source. */
+function fakeRemote() {
+  const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
+  const service = {
+    $on(event: string, listener: (...args: unknown[]) => void) {
+      let set = listeners.get(event);
+      if (set === undefined) {
+        set = new Set();
+        listeners.set(event, set);
+      }
+      set.add(listener);
+      return () => {
+        set!.delete(listener);
+      };
+    },
+  };
+  return {
+    service,
+    count: () => [...listeners.values()].reduce((total, set) => total + set.size, 0),
+    /** Deliver one failed-turn notification, message text included on purpose. */
+    emit(sessionId: string, message = 'secret failure text') {
+      for (const listener of [...(listeners.get('api-session/error') ?? [])]) listener(sessionId, message);
+    },
+  };
+}
+
+interface Harness {
+  clock: ReturnType<typeof fakeClock>;
+  rings: Reason[];
+  ringed: { reason: Reason; id: string; title: string }[];
+  /** Ring tokens passed to the matching-clear stopper, in order. */
+  stops: unknown[];
+  jobs: ReturnType<typeof fakeJobs>;
+  questions: ReturnType<typeof fakeUiSession>;
+  remote: ReturnType<typeof fakeRemote>;
+  update(sessions: SessionListSnapshot): void;
+  /** Adopt the roster service, as ctx.inject does when the jobs service becomes available. */
+  attach(): void;
+  detach(): void;
+  /** Adopt the session UI source, as ctx.inject does when the UI service arrives. */
+  attachUiSession(): void;
+  detachUiSession(): void;
+  /** Adopt the Remote event source, as ctx.inject does when the Remote assembly arrives. */
+  attachRemote(): void;
+  detachRemote(): void;
+  setDebounce(ms: number): void;
+  /** Make a future ring for this session return no token, like a silenced playRing. */
+  silence(sessionId: string): void;
+}
+
+function harness(): Harness {
+  const clock = fakeClock();
+  const rings: Reason[] = [];
+  const ringed: { reason: Reason; id: string; title: string }[] = [];
+  const stops: unknown[] = [];
+  const silent = new Set<string>();
+  const jobs = fakeJobs();
+  const questions = fakeUiSession();
+  const remote = fakeRemote();
+  let detach: (() => void) | undefined;
+  let detachUi: (() => void) | undefined;
+  let detachRemote: (() => void) | undefined;
+  let tokens = 0;
+  let debounceMs = 1500;
+  const watcher = client.createWatcher({
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    readSettings: () => ({ enabled: true, debounceMs }),
+    ring: (reason: Reason, session: { id: string; title: string }) => {
+      if (silent.has(session.id)) return undefined;
+      rings.push(reason);
+      ringed.push({ reason, id: session.id, title: session.title });
+      tokens += 1;
+      return tokens;
+    },
+    stopRing: (token: unknown) => {
+      stops.push(token);
+    },
+  });
+  return {
+    clock, rings, ringed, stops, jobs, questions, remote,
+    update: (sessions) => watcher.update(sessions),
+    attach: () => {
+      detach = watcher.attachRoster(jobs.service);
+    },
+    detach: () => {
+      detach?.();
+      detach = undefined;
+    },
+    attachUiSession: () => {
+      detachUi = watcher.attachUiSession(questions.service);
+    },
+    detachUiSession: () => {
+      detachUi?.();
+      detachUi = undefined;
+    },
+    attachRemote: () => {
+      detachRemote = watcher.attachRemote(remote.service);
+    },
+    detachRemote: () => {
+      detachRemote?.();
+      detachRemote = undefined;
+    },
+    setDebounce: (ms: number) => {
+      debounceMs = ms;
+    },
+    silence: (sessionId) => {
+      silent.add(sessionId);
+    },
+  };
+}
+
+test('isSettled needs complete quiescence', () => {
+  assert.equal(client.isSettled({ running: false, liveJobs: 0, liveChildren: 0, goalPhase: null }), true);
+  assert.equal(client.isSettled({ running: true, liveJobs: 0, liveChildren: 0, goalPhase: null }), false);
+  assert.equal(client.isSettled({ running: false, liveJobs: 1, liveChildren: 0, goalPhase: null }), false);
+  assert.equal(client.isSettled({ running: false, liveJobs: 0, liveChildren: 1, goalPhase: null }), false);
+  assert.equal(client.isSettled({ running: false, liveJobs: 0, liveChildren: 0, goalPhase: 'active' }), false);
+  assert.equal(client.isSettled({ running: false, liveJobs: 0, liveChildren: 0, goalPhase: 'blocked' }), true);
+  assert.equal(client.isSettled({ running: false, liveJobs: 0, liveChildren: 0, goalPhase: 'complete' }), true);
+});
+
+test('isSettled lets a failed turn settle while an active goal still holds a normal turn', () => {
+  const base = { running: false, liveJobs: 0, liveChildren: 0 };
+  for (const goalPhase of [null, 'active', 'blocked', 'complete']) {
+    assert.equal(
+      client.isSettled({ ...base, goalPhase }),
+      goalPhase !== 'active',
+      'a normal turn with goal ' + String(goalPhase),
+    );
+    assert.equal(
+      client.isSettled({ ...base, goalPhase, failed: true }),
+      true,
+      'a failed turn with goal ' + String(goalPhase),
+    );
+  }
+  // Failure is not a shortcut around running work.
+  assert.equal(client.isSettled({ ...base, running: true, goalPhase: 'active', failed: true }), false);
+  assert.equal(client.isSettled({ ...base, liveJobs: 1, goalPhase: 'active', failed: true }), false);
+  assert.equal(client.isSettled({ ...base, liveChildren: 1, goalPhase: 'active', failed: true }), false);
+  // An explicit false failure flag is just a normal turn.
+  assert.equal(client.isSettled({ ...base, goalPhase: 'active', failed: false }), false);
+});
+
+test('an already idle session does not ring on load', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(10000);
+  assert.deepEqual(h.rings, []);
+});
+
+test('a running child named only by the parent projection still holds the chime', () => {
+  const h = harness();
+  // The child row carries no parentId (a subagent fallback row may not) but it
+  // does carry the subagent origin, and the parent's own subagentCatalog names
+  // it while its row reports running: the session has not stopped.
+  h.update(sessionsOf({ a: { running: true } }));
+  h.update(sessionsOf({ a: { running: false, catalog: ['child-1'] }, 'child-1': { running: true, origin: 'subagent' } }));
+  h.clock.advance(10000);
+  assert.deepEqual(h.rings, []);
+  // Once the child stops, the parent settles normally.
+  h.update(sessionsOf({ a: { running: false, catalog: ['child-1'] }, 'child-1': { running: false, origin: 'subagent' } }));
+  h.clock.advance(2000);
+  assert.deepEqual(h.rings, ['done']);
+  h.update(sessionsOf({ a: { running: false, catalog: ['child-1'] }, 'child-1': { running: false, origin: 'subagent' } }));
+  h.clock.advance(10000);
+  assert.deepEqual(h.rings, ['done']);
+});
+test('a busy session that stops rings once after the quiet period', () => {
+  const h = harness();
+  h.attach();
+  h.update(sessionsOf({ a: { running: true, title: '修复登录' } }));
+  assert.deepEqual(h.jobs.watched, ['a']);
+  h.update(sessionsOf({ a: { running: false, title: '修复登录' } }));
+  assert.equal(h.clock.pending(), 1);
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+  // The banner needs to name the session, so the ring carries its label.
+  assert.deepEqual(h.ringed, [{ reason: 'done', id: 'a', title: '修复登录' }]);
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(10000);
+  assert.deepEqual(h.rings, ['done']);
+});
+
+test('waiting on a live job stays silent until the job settles', () => {
+  const h = harness();
+  h.attach();
+  h.update(sessionsOf({ a: { running: true } }));
+  h.jobs.set({ a: [{ status: 'running', owner: 'a' }] });
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, []);
+  h.jobs.set({ a: [{ status: 'completed', owner: 'a' }] });
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+});
+
+test('an output-only roster frame does not rerun the settle pass', () => {
+  const h = harness();
+  h.attach();
+  h.update(sessionsOf({ a: { running: true } }));
+  h.jobs.set({ a: [{ status: 'running', owner: 'a' }] });
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(1500);
+  // The check saw the live job and left the quiet stretch pending without a timer.
+  assert.deepEqual(h.rings, []);
+  assert.equal(h.clock.pending(), 0);
+  // The job model notifies on output frames too, but no roster moved: the pass
+  // must not reschedule the settle check for that.
+  h.jobs.poke();
+  assert.equal(h.clock.pending(), 0, 'output-only roster frames must not schedule a pass');
+  // A real roster change still lands and lets the chime ring after the quiet period.
+  h.jobs.set({ a: [{ status: 'completed', owner: 'a' }] });
+  assert.equal(h.clock.pending(), 1);
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+});
+
+test('an unowned job never counts as this session\'s work', () => {
+  const h = harness();
+  h.attach();
+  h.update(sessionsOf({ a: { running: true } }));
+  h.jobs.set({ a: [{ status: 'running' }] });
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+});
+
+test('a roster service that arrives after activation is adopted', () => {
+  // The client boot mounts the API controllers in sequence, so the job half can
+  // activate while the session controller's Remote namespace is still the last
+  // one mounted: the roster service really does arrive after the bundle runs.
+  const h = harness();
+  h.update(sessionsOf({ a: { running: true } }));
+  h.update(sessionsOf({ a: { running: false } }));
+  h.jobs.set({ a: [{ status: 'running', owner: 'a' }] });
+  h.attach();
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, [], 'the live job must hold the chime once the roster is adopted');
+  assert.deepEqual(h.jobs.watched, ['a']);
+  h.jobs.set({ a: [{ status: 'completed', owner: 'a' }] });
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+});
+
+test('losing the roster service releases its subscriptions', () => {
+  const h = harness();
+  h.attach();
+  h.update(sessionsOf({ a: { running: true } }));
+  assert.deepEqual(h.jobs.watched, ['a']);
+  h.detach();
+  assert.deepEqual(h.jobs.released, ['a']);
+  // With the source gone, a later turn end settles on the sessions alone.
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+});
+
+test('a working subagent holds the chime', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: true }, child: { running: true, parentId: 'a', origin: 'subagent' } }));
+  h.update(sessionsOf({ a: { running: false }, child: { running: true, parentId: 'a', origin: 'subagent' } }));
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, []);
+  h.update(sessionsOf({ a: { running: false }, child: { running: false, parentId: 'a', origin: 'subagent' } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+});
+test('the child index attributes live children to the right parent', () => {
+  // child-1 belongs to `a` through both sources; child-2 only through
+  // parentId; child-5 only through `a`'s catalog even though it names `b` as
+  // its parent (the host-computed catalog is authoritative). child-3 runs
+  // under `b` and child-4 under no parent at all: neither may hold `a`.
+  const h = harness();
+  const withChildren = (live: boolean) => sessionsOf({
+    a: { running: false, catalog: ['child-1', 'child-5'] },
+    'child-1': { running: live, parentId: 'a', origin: 'subagent' },
+    'child-2': { running: live, parentId: 'a', origin: 'subagent' },
+    'child-5': { running: live, parentId: 'b', origin: 'subagent' },
+    'child-3': { running: true, parentId: 'b', origin: 'subagent' },
+    'child-4': { running: true, origin: 'subagent' },
+    // An ordinary fork may retain the source id but is not a subagent: it must
+    // not hold `a`'s chime.
+    fork: { running: true, parentId: 'a' },
+    b: { running: true },
+  });
+  h.update(sessionsOf({ a: { running: true }, b: { running: true } }));
+  h.update(withChildren(true));
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, [], 'every attributed live child holds the chime exactly once');
+  // Only `a`'s three children stop: the chime must ring for `a` while the
+  // other parent's and the unattributed child keep running.
+  h.update(withChildren(false));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+});
+
+test('subagent sessions never ring on their own', () => {
+  const h = harness();
+  h.update(sessionsOf({ child: { running: true, parentId: 'a', origin: 'subagent' } }));
+  h.update(sessionsOf({ child: { running: false, parentId: 'a', origin: 'subagent' } }));
+  h.clock.advance(10000);
+  assert.deepEqual(h.rings, []);
+});
+
+test('an ordinary fork rings on its own even when it keeps the source id', () => {
+  // dsh 0.2.2 stopped treating an ordinary fork as a subagent; the durable
+  // parentSession is historical metadata, and origin is the classification.
+  const h = harness();
+  h.update(sessionsOf({ fork: { running: true, parentId: 'source' } }));
+  h.update(sessionsOf({ fork: { running: false, parentId: 'source' } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+});
+
+test('a running ordinary fork does not hold its source session', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: true }, fork: { running: true, parentId: 'a' } }));
+  h.update(sessionsOf({ a: { running: false }, fork: { running: true, parentId: 'a' } }));
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, ['done']);
+  h.update(sessionsOf({ a: { running: false }, fork: { running: false, parentId: 'a' } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done', 'done']);
+});
+
+test('an active goal holds the chime and a blocked goal rings at once', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: true, phase: 'active' } }));
+  h.update(sessionsOf({ a: { running: false, phase: 'active' } }));
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, []);
+  h.update(sessionsOf({ a: { running: false, phase: 'blocked' } }));
+  assert.deepEqual(h.rings, ['blocked']);
+});
+
+test('a blocked goal rings once even while its turn is still running', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: true, phase: 'active' } }));
+  h.update(sessionsOf({ a: { running: true, phase: 'blocked' } }));
+  assert.deepEqual(h.rings, ['blocked']);
+  // Another running frame is NOT a new stretch, so it must not re-arm "done".
+  h.update(sessionsOf({ a: { running: true, phase: 'blocked' } }));
+  h.update(sessionsOf({ a: { running: false, phase: 'blocked' } }));
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, ['blocked'], 'a blocked stretch must not also ring done');
+  // A genuinely new turn opens a fresh stretch; its normal stop rings done.
+  h.update(sessionsOf({ a: { running: true, phase: 'blocked' } }));
+  h.update(sessionsOf({ a: { running: false, phase: 'blocked' } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['blocked', 'done']);
+});
+
+test('a failed turn rings error instead of done', () => {
+  const h = harness();
+  h.attachRemote();
+  h.update(sessionsOf({ a: { running: true } }));
+  h.remote.emit('a');
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['error']);
+});
+
+test('a failed turn rings error even while the goal phase is active', () => {
+  const h = harness();
+  h.attachRemote();
+  h.update(sessionsOf({ a: { running: true, phase: 'active' } }));
+  h.remote.emit('a');
+  h.update(sessionsOf({ a: { running: false, phase: 'active' } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['error'], 'the active-goal blind spot must not swallow a failure');
+});
+
+test('a failed turn waits for a live owned job and then rings error', () => {
+  const h = harness();
+  h.attachRemote();
+  h.attach();
+  h.update(sessionsOf({ a: { running: true } }));
+  h.jobs.set({ a: [{ status: 'running', owner: 'a' }] });
+  h.update(sessionsOf({ a: { running: false } }));
+  h.remote.emit('a');
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, [], 'the live job holds the settle outcome');
+  h.jobs.set({ a: [{ status: 'completed', owner: 'a' }] });
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['error']);
+});
+
+test('failed-turn errors for subagents and unknown sessions are ignored', () => {
+  const h = harness();
+  h.attachRemote();
+  h.update(sessionsOf({ child: { running: true, parentId: 'a', origin: 'subagent' } }));
+  h.remote.emit('child');
+  h.remote.emit('ghost');
+  h.update(sessionsOf({ child: { running: false, parentId: 'a', origin: 'subagent' } }));
+  h.clock.advance(5000);
+  assert.deepEqual(h.rings, []);
+});
+
+test('a late error after a blocked or done ring does not ring twice', () => {
+  const blocked = harness();
+  blocked.attachRemote();
+  blocked.update(sessionsOf({ a: { running: true, phase: 'active' } }));
+  blocked.update(sessionsOf({ a: { running: true, phase: 'blocked' } }));
+  assert.deepEqual(blocked.rings, ['blocked']);
+  blocked.remote.emit('a');
+  blocked.update(sessionsOf({ a: { running: false, phase: 'blocked' } }));
+  blocked.clock.advance(5000);
+  assert.deepEqual(blocked.rings, ['blocked'], 'a late error must not follow a blocked ring');
+
+  const done = harness();
+  done.attachRemote();
+  done.update(sessionsOf({ a: { running: true } }));
+  done.update(sessionsOf({ a: { running: false } }));
+  done.clock.advance(1500);
+  assert.deepEqual(done.rings, ['done']);
+  done.remote.emit('a');
+  done.clock.advance(5000);
+  assert.deepEqual(done.rings, ['done'], 'a late error must not follow a done ring');
+});
+
+test('the question watcher seeds a silent baseline and rings once per new key', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: false, title: 'top level' } }));
+  h.questions.set({
+    a: { key: 'q1', kind: 'question' },
+    child: { key: 'c1', kind: 'question' },
+    ghost: { key: 'g1', kind: 'question' },
+  });
+  h.attachUiSession();
+  assert.deepEqual(h.rings, [], 'requests already pending at baseline are silent');
+
+  h.questions.set({
+    a: { key: 'q1', kind: 'question' },
+    child: { key: 'c2', kind: 'question' },
+    ghost: { key: 'g2', kind: 'question' },
+  });
+  assert.deepEqual(h.rings, [], 'an unchanged key and untracked sessions stay silent');
+
+  h.questions.set({ a: { key: 'q2', kind: 'approval' } });
+  assert.deepEqual(h.rings, ['question']);
+  assert.deepEqual(h.ringed, [{ reason: 'question', id: 'a', title: 'top level' }]);
+
+  h.questions.set({ a: { key: 'q2', kind: 'approval' } });
+  assert.deepEqual(h.rings, ['question'], 'the same key repeated stays silent');
+
+  h.questions.set({ a: { key: 'q3', kind: 'plan-review' } });
+  assert.deepEqual(h.rings, ['question', 'question'], 'a replacement key rings again');
+
+  h.questions.set({});
+  assert.deepEqual(h.rings, ['question', 'question']);
+  assert.deepEqual(h.stops, [1, 2], 'the replaced ring and the active ring are both stopped');
+
+  h.questions.set({ a: { key: 'other', kind: 'completion-reminder' } });
+  assert.deepEqual(h.rings, ['question', 'question'], 'non-attention kinds never ring');
+  assert.deepEqual(h.stops, [1, 2]);
+});
+
+test('an older question clear never stops a newer active ring', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: false }, b: { running: false } }));
+  h.questions.set({});
+  h.attachUiSession();
+  h.questions.set({ a: { key: 'a1', kind: 'question' } });
+  assert.deepEqual(h.rings, ['question']);
+  h.questions.set({ a: { key: 'a1', kind: 'question' }, b: { key: 'b1', kind: 'approval' } });
+  assert.deepEqual(h.rings, ['question', 'question']);
+  // Clear the older a request while b's newer ring owns the banner.
+  h.questions.set({ b: { key: 'b1', kind: 'approval' } });
+  assert.deepEqual(h.stops, [], 'an older clear must not stop a newer ring');
+  // Clearing b's matching request does stop its ring.
+  h.questions.set({});
+  assert.deepEqual(h.stops, [2]);
+});
+
+test('a silent newer question does not orphan the active question ring', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: false }, b: { running: false } }));
+  h.questions.set({});
+  h.attachUiSession();
+  h.questions.set({ a: { key: 'a1', kind: 'question' } });
+  assert.deepEqual(h.rings, ['question']);
+  h.silence('b');
+  h.questions.set({
+    a: { key: 'a1', kind: 'question' },
+    b: { key: 'b1', kind: 'approval' },
+  });
+  assert.deepEqual(h.rings, ['question'], 'B is silent, but it must not orphan A');
+  h.questions.set({ b: { key: 'b1', kind: 'approval' } });
+  assert.deepEqual(h.stops, [1], 'clearing A stops A even after the newer silent B');
+});
+
+test('a question key that returns after a catalog reload does not ring again', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: false } }));
+  h.questions.set({});
+  h.attachUiSession();
+  h.questions.set({ a: { key: 'a1', kind: 'question' } });
+  assert.deepEqual(h.rings, ['question']);
+  h.update(sessionsOf({}));
+  assert.deepEqual(h.stops, [1], 'leaving the catalog stops the active question ring');
+  h.update(sessionsOf({ a: { running: false } }));
+  h.questions.set({ a: { key: 'a1', kind: 'question' } });
+  assert.deepEqual(h.rings, ['question'], 'the same sessionId + key never rings twice');
+});
+
+test('detaching the session UI stops its active question ring', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: false } }));
+  h.questions.set({});
+  h.attachUiSession();
+  h.questions.set({ a: { key: 'a1', kind: 'question' } });
+  assert.deepEqual(h.rings, ['question']);
+  h.detachUiSession();
+  assert.deepEqual(h.stops, [1], 'a removed UI service must not leave an unstoppable ring');
+});
+
+test('a done ring is not followed by a late blocked ring in the same stretch', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: true, phase: 'complete' } }));
+  h.update(sessionsOf({ a: { running: false, phase: 'complete' } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done']);
+  h.update(sessionsOf({ a: { running: false, phase: 'blocked' } }));
+  assert.deepEqual(h.rings, ['done'], 'one settle stretch has one ring');
+});
+
+test('a second quiet stretch rings again after a new turn', () => {
+  const h = harness();
+  h.update(sessionsOf({ a: { running: true } }));
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(1500);
+  h.update(sessionsOf({ a: { running: true } }));
+  h.update(sessionsOf({ a: { running: false } }));
+  h.clock.advance(1500);
+  assert.deepEqual(h.rings, ['done', 'done']);
+});
+
+test('a session that leaves the catalog releases its roster watch', () => {
+  const h = harness();
+  h.attach();
+  h.update(sessionsOf({ a: { running: true } }));
+  h.update(sessionsOf({}));
+  assert.deepEqual(h.jobs.released, ['a']);
+});
+
+/**
+ * Drive the real apply() wiring with a fake client context. The job roster is
+ * deliberately NOT available through ctx.get: it is delivered through the
+ * ctx.inject registration once the caller says the controller mounted, which is
+ * exactly the boot order the one-shot ctx.get() read used to lose.
+ */
+function applyHarness() {
+  const value: Record<string, unknown> = { debounceMs: 0 };
+  const formListeners = new Set<() => void>();
+  const form = {
+    getSnapshot: () => ({ status: 'ready', writable: true, revision: 1, value }),
+    subscribe(listener: () => void) {
+      formListeners.add(listener);
+      return () => {
+        formListeners.delete(listener);
+      };
+    },
+    mutate: async () => true,
+  };
+  const sessionListeners = new Set<() => void>();
+  let sessionSnapshot: SessionListSnapshot = { ids: [], byId: {} };
+  const pendingInjections: { names: readonly string[]; register: (scope: unknown) => unknown }[] = [];
+  /** Every service the fake context currently provides, keyed the way Cordis names it. */
+  const services: Record<string, unknown> = {};
+  const effects: (() => void)[] = [];
+  const ctx = {
+    configForms: {
+      get: () => form,
+      whileServed: (_rows: readonly string[], register: () => unknown) => register(),
+    },
+    slots: { inject: () => undefined, register: () => undefined },
+    effect: (callback: () => unknown) => {
+      const disposer = callback();
+      if (typeof disposer === 'function') effects.push(disposer as () => void);
+      return disposer;
+    },
+    inject: (names: readonly string[], register: (scope: unknown) => unknown) => {
+      pendingInjections.push({ names, register });
+      return undefined;
+    },
+    sessions: {
+      list: {
+        getSnapshot: () => sessionSnapshot,
+        subscribe(listener: () => void) {
+          sessionListeners.add(listener);
+          return () => {
+            sessionListeners.delete(listener);
+          };
+        },
+      },
+    },
+    // Models the real boot: the optional service is NOT readable yet.
+    get: () => undefined,
+  };
+  /**
+   * Deliver one optional service the way ctx.inject does: run only the
+   * registrations that wait for it, with the services available so far.
+   */
+  function provide(name: string, service: unknown) {
+    services[name] = service;
+    for (const entry of [...pendingInjections]) {
+      if (!entry.names.includes(name)) continue;
+      pendingInjections.splice(pendingInjections.indexOf(entry), 1);
+      const disposer = entry.register({ ...services });
+      if (typeof disposer === 'function') effects.push(disposer as () => void);
+    }
+  }
+  return {
+    ctx,
+    formListeners,
+    setSessions(next: SessionListSnapshot) {
+      sessionSnapshot = next;
+      for (const listener of [...sessionListeners]) listener();
+    },
+    provide,
+    provideJobs(service: unknown) {
+      provide('jobs', service);
+    },
+    /** Run every registered effect disposer, the way a plugin fiber unload does. */
+    dispose() {
+      for (const disposer of effects.reverse()) disposer();
+      effects.length = 0;
+    },
+  };
+}
+
+test('apply adopts the job roster when the service arrives after activation', () => {
+  // The client boot mounts the API controllers in sequence, so the chime's apply
+  // runs while ctx.get('jobs') is still undefined. The roster must be picked up
+  // through ctx.inject, or the chime rings at every turn end with a live job.
+  let rings = 0;
+  const windowStub = Reflect.get(globalThis, 'window') as object;
+  const previous = Reflect.get(windowStub, 'AudioContext');
+  Reflect.set(windowStub, 'AudioContext', class {
+    state = 'running';
+    close() { return Promise.resolve(); }
+    resume() {
+      return Promise.resolve();
+    }
+    decodeAudioData() {
+      rings += 1;
+      return Promise.reject(new Error('stub'));
+    }
+  });
+  try {
+    const h = applyHarness();
+    client.apply(h.ctx);
+    const jobs = fakeJobs();
+    h.setSessions(sessionsOf({ a: { running: true } }));
+    assert.deepEqual(jobs.watched, [], 'no roster exists before the service arrives');
+    h.provideJobs(jobs.service);
+    assert.deepEqual(jobs.watched, ['a'], 'the late roster service is adopted and watched');
+    jobs.set({ a: [{ status: 'running', owner: 'a' }] });
+    h.setSessions(sessionsOf({ a: { running: false } }));
+    assert.equal(rings, 0, 'a live background job must hold the chime');
+    jobs.set({ a: [{ status: 'completed', owner: 'a' }] });
+    assert.equal(rings, 1, 'the chime rings once the job settles');
+  } finally {
+    Reflect.set(windowStub, 'AudioContext', previous);
+  }
+});
+
+test('apply adopts the optional session UI and Remote services when they arrive', () => {
+  let decoded = 0;
+  const windowStub = Reflect.get(globalThis, 'window') as object;
+  const previous = Reflect.get(windowStub, 'AudioContext');
+  Reflect.set(windowStub, 'AudioContext', class {
+    state = 'running';
+    close() { return Promise.resolve(); }
+    resume() {
+      return Promise.resolve();
+    }
+    decodeAudioData() {
+      decoded += 1;
+      return Promise.reject(new Error('stub'));
+    }
+  });
+  try {
+    const h = applyHarness();
+    client.apply(h.ctx);
+    h.setSessions(sessionsOf({ a: { running: false } }));
+    const ui = fakeUiSession();
+    ui.set({});
+    h.provide('uiSession', ui.service);
+    assert.equal(ui.listeners.size, 1, 'the UI status source is adopted through ctx.inject');
+    ui.set({ a: { key: 'q1', kind: 'question' } });
+    assert.equal(decoded, 1, 'a pending question rings through the attached UI service');
+    const remote = fakeRemote();
+    h.provide('remote', remote.service);
+    remote.emit('a');
+    assert.equal(decoded, 2, 'a failed turn rings through the attached Remote service');
+    // The attach handles are fiber effects: unloading releases both registrations.
+    h.dispose();
+    assert.equal(ui.listeners.size, 0, 'disposing releases the UI status subscription');
+    assert.equal(remote.count(), 0, 'disposing releases the Remote event registration');
+  } finally {
+    Reflect.set(windowStub, 'AudioContext', previous);
+  }
+});
+
+test('disposing the plugin releases the settings-form listener', () => {
+  const h = applyHarness();
+  client.apply(h.ctx);
+  assert.equal(h.formListeners.size, 1, 'the settings form listener is installed');
+  h.dispose();
+  assert.equal(h.formListeners.size, 0, 'the settings form listener is released with the plugin fiber');
+});
+
+/** Minimal settings-form stub matching the public service contract. */
+function formOf(value: unknown, revision = 7): { form: ConfigForm; operations: PathOperation[][]; snapshot: ConfigFormSnapshot } {
+  const operations: PathOperation[][] = [];
+  const snapshot = { status: 'ready', writable: true, revision, value };
+  const form: ConfigForm = {
+    getSnapshot: () => snapshot,
+    subscribe: () => () => {},
+    async mutate(ops) {
+      operations.push([...ops]);
+      return true;
+    },
+  };
+  return { form, operations, snapshot };
+}
+
+test('the editor seeds, stages, and saves one fenced mutation', async () => {
+  const { form, operations } = formOf({ enabled: true, soundDone: 'chime-soft' });
+  const editor = client.createEditor(form);
+  editor.start();
+  assert.equal(editor.getSnapshot().values.soundDone, 'chime-soft');
+  editor.edit('soundDone', 'marimba');
+  editor.edit('durationMs', '3000');
+  editor.edit('dndStart', '22:00');
+  editor.edit('restMode', true);
+  assert.equal(editor.getSnapshot().dirty, true);
+  assert.equal(await editor.save(), true);
+  assert.deepEqual(operations, [[
+    { op: 'set', path: ['soundDone'], value: 'marimba' },
+    { op: 'set', path: ['durationMs'], value: 3000 },
+    { op: 'set', path: ['dndStart'], value: '22:00' },
+    { op: 'set', path: ['restMode'], value: true },
+  ]]);
+});
+
+test('the editor refuses invalid numbers and keeps the draft', async () => {
+  const { form, operations } = formOf({});
+  const editor = client.createEditor(form);
+  editor.start();
+  editor.edit('volume', '3');
+  assert.equal(await editor.save(), false);
+  assert.equal(operations.length, 0);
+  assert.match(editor.getSnapshot().error, /音量/);
+});
+
+test('reset submits unsets for every field', async () => {
+  const { form, operations } = formOf({ enabled: true });
+  const editor = client.createEditor(form);
+  editor.start();
+  editor.reset();
+  await editor.save();
+  assert.deepEqual(operations[0]?.map(op => op.op), new Array(client.FIELDS.length).fill('unset'));
+});
+
+test('settingsOf falls back to the shipped defaults on junk', () => {
+  assert.deepEqual(client.settingsOf({}), client.settingsOf(null));
+  assert.equal(client.settingsOf({ soundDone: 'nope' }).soundDone, 'chime-soft');
+  assert.equal(client.settingsOf({ soundQuestion: 'nope' }).soundQuestion, 'bell-bright');
+  assert.equal(client.settingsOf({ soundError: 'nope' }).soundError, 'alert-sharp');
+  assert.equal(client.settingsOf({ chimeQuestion: 'yes' }).chimeQuestion, true);
+  assert.equal(client.settingsOf({ chimeError: 0 }).chimeError, true);
+  assert.equal(client.settingsOf({ volume: 9 }).volume, 1);
+  assert.equal(client.settingsOf({ debounceMs: -1 }).debounceMs, 1500);
+  assert.equal(client.settingsOf({ quietStyle: 'shout' }).quietStyle, 'short');
+  assert.equal(client.settingsOf({ dndStart: '25:00' }).dndStart, '');
+  assert.equal(client.settingsOf({ restMode: 'yes' }).restMode, false);
+  assert.equal(client.settingsOf({ minRingMs: -1 }).minRingMs, 3000);
+  assert.equal(client.settingsOf({ banner: 'yes' }).banner, true);
+  assert.equal(client.settingsOf({ bannerPlacement: 'middle' }).bannerPlacement, 'bottom-center');
+  assert.equal(client.settingsOf({ bannerPlacement: 'modal' }).bannerPlacement, 'modal');
+});
+
+test('attention chime settings default, switch independently, and honour the master switch', () => {
+  const defaults = client.settingsOf({});
+  assert.equal(defaults.soundQuestion, 'bell-bright');
+  assert.equal(defaults.soundError, 'alert-sharp');
+  assert.equal(defaults.chimeQuestion, true);
+  assert.equal(defaults.chimeError, true);
+
+  const settings = { ...defaults, soundQuestion: 'blip', soundError: 'marimba' };
+  assert.equal(client.chimeSound('question', settings), 'blip');
+  assert.equal(client.chimeSound('error', settings), 'marimba');
+  assert.equal(client.chimeSound('done', settings), 'chime-soft');
+  assert.equal(client.chimeSound('blocked', settings), 'alert-low');
+
+  // The two new reasons switch independently.
+  assert.equal(client.chimeSound('question', { ...settings, chimeQuestion: false }), undefined);
+  assert.equal(client.chimeSound('error', { ...settings, chimeQuestion: false }), 'marimba');
+  assert.equal(client.chimeSound('error', { ...settings, chimeError: false }), undefined);
+  assert.equal(client.chimeSound('question', { ...settings, chimeError: false }), 'blip');
+
+  // The master switch wins over everything, including the preview override.
+  for (const reason of ['done', 'blocked', 'question', 'error']) {
+    assert.equal(client.chimeSound(reason, { ...settings, enabled: false }), undefined, reason);
+  }
+  assert.equal(client.chimeSound('done', settings, 'marimba'), 'marimba');
+  assert.equal(client.chimeSound('done', { ...settings, enabled: false }, 'marimba'), undefined);
+});
+
+test('parseClock reads a 24-hour local time', () => {
+  assert.equal(client.parseClock('00:00'), 0);
+  assert.equal(client.parseClock('22:30'), 22 * 60 + 30);
+  assert.equal(client.parseClock(' 08:00 '), 480);
+  assert.equal(client.parseClock('24:00'), null);
+  assert.equal(client.parseClock('8:00'), null);
+  assert.equal(client.parseClock(''), null);
+  assert.equal(client.parseClock(undefined), null);
+});
+
+test('the do-not-disturb window handles same-day and cross-midnight spans', () => {
+  const at = (hours: number, minutes = 0) => new Date(2026, 0, 1, hours, minutes, 0);
+  // 13:00–14:00, same day.
+  assert.equal(client.inQuietHours(at(12, 59), '13:00', '14:00'), false);
+  assert.equal(client.inQuietHours(at(13, 0), '13:00', '14:00'), true);
+  assert.equal(client.inQuietHours(at(13, 59), '13:00', '14:00'), true);
+  assert.equal(client.inQuietHours(at(14, 0), '13:00', '14:00'), false);
+  // 22:00–08:00 crosses midnight.
+  assert.equal(client.inQuietHours(at(23), '22:00', '08:00'), true);
+  assert.equal(client.inQuietHours(at(3), '22:00', '08:00'), true);
+  assert.equal(client.inQuietHours(at(12), '22:00', '08:00'), false);
+  // Empty or zero-length windows are off.
+  assert.equal(client.inQuietHours(at(23), '', '08:00'), false);
+  assert.equal(client.inQuietHours(at(23), '22:00', ''), false);
+  assert.equal(client.inQuietHours(at(23), '22:00', '22:00'), false);
+});
+
+test('effectiveWindowMs applies the master switch and the quiet rules', () => {
+  const at = (hours: number) => new Date(2026, 0, 1, hours, 0, 0);
+  const base = {
+    enabled: true, soundDone: 'chime-soft', soundBlocked: 'alert-low', volume: 0.8,
+    durationMs: 0, debounceMs: 1500, quietStyle: 'short', quietShortMs: 400,
+    dndStart: '', dndEnd: '', restMode: false,
+  };
+  // 0 duration = one full play-through.
+  assert.equal(client.effectiveWindowMs(base, 500, at(12)), 500);
+  assert.equal(client.effectiveWindowMs({ ...base, durationMs: 60_000 }, 500, at(12)), 60_000);
+  // Master switch off wins over everything.
+  assert.equal(client.effectiveWindowMs({ ...base, enabled: false }, 500, at(12)), 0);
+  // Rest mode shortens to quietShortMs, silence drops the chime entirely.
+  assert.equal(client.effectiveWindowMs({ ...base, restMode: true }, 500, at(12)), 400);
+  assert.equal(client.effectiveWindowMs({ ...base, restMode: true, quietStyle: 'silent' }, 500, at(12)), 0);
+  // A short quiet window never stretches a longer request.
+  assert.equal(client.effectiveWindowMs({ ...base, restMode: true, durationMs: 60_000 }, 500, at(12)), 400);
+  assert.equal(client.effectiveWindowMs({ ...base, restMode: true, durationMs: 200 }, 500, at(12)), 200);
+  // The do-not-disturb window behaves exactly like rest mode while it is active.
+  const dnd = { ...base, dndStart: '22:00', dndEnd: '08:00' };
+  assert.equal(client.effectiveWindowMs(dnd, 500, at(23)), 400);
+  assert.equal(client.effectiveWindowMs(dnd, 500, at(12)), 500);
+});
+
+test('the bundle declares a flat service-name inject list', () => {
+  // Regression guard for the 0.5.1 boot failure: an object here is read as a
+  // service map, so { required, optional } waits on two phantom services and
+  // the Web boot audit fails the entire page.
+  assert.ok(Array.isArray(client.inject), 'inject must be an array, got ' + typeof client.inject);
+  assert.deepEqual(client.inject, ['slots', 'configForms', 'sessions']);
+  for (const service of client.inject) {
+    assert.equal(typeof service, 'string', 'inject entries must be service names');
+    assert.notEqual(service, 'required');
+    assert.notEqual(service, 'optional');
+  }
+});
+
+test('shortest-ring guard: activity cannot cut a ring too early', () => {
+  assert.equal(client.shouldStopOnGesture(undefined, 10_000, 3000), false);
+  assert.equal(client.shouldStopOnGesture(1000, 2500, 3000), false);
+  assert.equal(client.shouldStopOnGesture(1000, 4000, 3000), true);
+  // A zero minimum lets the very next gesture stop it.
+  assert.equal(client.shouldStopOnGesture(1000, 1000, 0), true);
+});
+
+test('the masked modal ignores activity; every other placement honours the guard', () => {
+  // Modal: never stopped by a gesture, however long the ring has been going.
+  assert.equal(client.gestureStopsRing('modal', true, 1000, 99_999, 3000), false);
+  // Without the banner there is no modal to acknowledge, so the guard decides.
+  assert.equal(client.gestureStopsRing('modal', false, 1000, 5000, 3000), true);
+  // Corner and centre placements behave like the plain guard.
+  for (const placement of ['bottom-center', 'bottom-right', 'bottom-left', 'top-right', 'top-left', 'center']) {
+    assert.equal(client.gestureStopsRing(placement, true, 1000, 2000, 3000), false, placement);
+    assert.equal(client.gestureStopsRing(placement, true, 1000, 5000, 3000), true, placement);
+  }
+  assert.deepEqual(client.PLACEMENTS, ['bottom-center', 'bottom-right', 'bottom-left', 'top-right', 'top-left', 'center', 'modal']);
+});
+
+test('the time field accepts an empty string or HH:mm only', () => {
+  assert.equal(client.checkTime(''), undefined);
+  assert.equal(client.checkTime('07:05'), undefined);
+  assert.match(String(client.checkTime('7:05')), /HH:mm/);
+  assert.match(String(client.checkTime('25:00')), /HH:mm/);
+});
+
+test('parse helpers reject junk', () => {
+  assert.deepEqual(client.parseDuration('1500'), { value: 1500 });
+  assert.ok(client.parseDuration('1.5').error);
+  assert.deepEqual(client.parseVolume('0.35'), { value: 0.35 });
+  assert.ok(client.parseVolume('2').error);
+});
+
+test('the bundle declares its row and the shipped chime set', () => {
+  assert.equal(client.ROW_ID, 'dsh-toolbox');
+  assert.deepEqual(client.SOUND_IDS, ['chime-soft', 'bell-bright', 'marimba', 'alert-low', 'alert-sharp', 'blip']);
+  assert.deepEqual(client.FIELDS, [
+    'enabled', 'soundDone', 'soundBlocked', 'soundQuestion', 'soundError', 'chimeQuestion', 'chimeError',
+    'volume', 'durationMs', 'debounceMs', 'quietStyle', 'quietShortMs', 'dndStart', 'dndEnd',
+    'restMode', 'minRingMs', 'banner', 'bannerPlacement',
+  ]);
+});

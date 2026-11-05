@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { parse } from 'yaml';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { inspectMigration, dryRunMigration, runMigration, rollbackMigration, startAutomaticMigration } from '../../src/migration/index.ts';
-import { profilePaths } from '../../src/migration/storage.ts';
+import { profilePaths, withProfileLock } from '../../src/migration/storage.ts';
 import type { Distribution, LoaderEntry, NativeMigrationHost } from '../../src/migration/types.ts';
 
 const require = createRequire(import.meta.url);
@@ -257,6 +257,7 @@ test('auto=false partial migration keeps unadopted absent defaults gated and ref
     current.context.enabled=false;await writeFile(join(dir,'cordis.patch.yml'),JSON.stringify([{id:target.rowId,config:{modules:{context:{enabled:false}}}}]));
     await controller.retry();assert.equal(controller.state().modules.context?.ready,true);
     current.context.enabled=true;await writeFile(join(dir,'cordis.patch.yml'),JSON.stringify([{id:target.rowId,config:{modules:{context:{enabled:true}}}}]));
+    listeners.get('loader/volatile-update')!();
     await controller.retry();assert.equal(controller.state().modules.context?.ready,true);
   } finally {clearInterval(keep);controller.dispose();}
 }));
@@ -302,4 +303,85 @@ for(const direction of ['rewound','future'])test('retry refuses '+direction+' pr
   await writeFile(join(dir,'cordis.patch.yml'),image);
   await assert.rejects(runMigration(host,target,{retry:true}),/concurrent profile edit/);
   assert.equal(await readFile(join(dir,'cordis.patch.yml'),'utf8'),image);
+}));
+test('disabled host enable invalidates cached ready synchronously before locked owner registration',async()=>fixture(async({host,dir,entries})=>{
+  const created=childRun(host,"console.log(JSON.stringify(await runMigration(host,target)));",false) as {operationId:string};
+  let input=await inspectMigration(host,target);const values=input.rows.find(row=>row.id===target.rowId)!.config as any;
+  values.modules.retry.enabled=false;
+  const setConfig=async()=>{const rows=parse(await readFile(join(dir,'cordis.patch.yml'),'utf8'));rows.find((row:any)=>row.id===target.rowId).config=values;await writeFile(join(dir,'cordis.patch.yml'),JSON.stringify(rows));};
+  await setConfig();host.moduleConfig=id=>values.modules[id];
+  entries.push({id:'include:dsh-toolbox',options:{id:'dsh-toolbox',name:'dsh-toolbox'},fiber:{state:2,effectiveConfig:values}});
+  const events=new Map<string,()=>void>();host.on=(name,listener)=>{events.set(name,listener);return()=>events.delete(name);};
+  const controller=startAutomaticMigration(host,target);const keep=setInterval(()=>{},1000);
+  let unlock!:()=>void;let lockTaken!:()=>void;const held=new Promise<void>(resolve=>{lockTaken=resolve;});const release=new Promise<void>(resolve=>{unlock=resolve;});
+  let blocker:Promise<unknown>|undefined;
+  try {
+    await controller.settled;assert.equal(controller.state().modules.retry?.ready,true);
+    const paths=await profilePaths(host,target.rowId);const before=JSON.parse(await readFile(paths.journal,'utf8'));
+    assert.ok(!(before.owners.retry??[]).some((owner:string)=>owner.startsWith(process.pid+':')));
+    blocker=withProfileLock(host,async()=>{lockTaken();await release;});await held;
+    values.modules.retry.enabled=true;await setConfig();
+    // This getter is the exact first operation of the real root reconcile; it must
+    // fail closed even if that root listener runs BEFORE the migration event listener.
+    assert.equal(controller.state().modules.retry?.ready,false,'root cannot consume disabled-startup ready after an unregistered enable');
+    events.get('loader/volatile-update')!();
+    assert.equal(controller.state().modules.retry?.ready,false,'native event returns before any async registration can acquire the held lock');
+    const still=JSON.parse(await readFile(paths.journal,'utf8'));assert.ok(!(still.owners.retry??[]).some((owner:string)=>owner.startsWith(process.pid+':')));
+    unlock();await blocker;
+    const registered=await controller.retry();assert.equal(registered.modules.retry?.ready,true);
+    const after=JSON.parse(await readFile(paths.journal,'utf8'));assert.ok(after.owners.retry.some((owner:string)=>owner.startsWith(process.pid+':')));
+    await rollbackMigration({...host,loader:{entries:()=>[]}},target,{operationId:created.operationId,modules:['retry']});
+    assert.equal((await rollbackMigration({...host,loader:{entries:()=>[]}},target,{operationId:created.operationId,modules:['retry']})).modules.retry?.phase,'restart-required');
+    assert.ok(!JSON.parse(await readFile(join(dir,'package.json'),'utf8')).dsh.profile.bundles.includes('dsh-stream-retry'));
+  } finally {unlock();if(blocker)await blocker;controller.dispose();clearInterval(keep);}
+}));
+test('pre-enable async scan cannot republish cached ready after its disabled owner observation',async()=>fixture(async({host,dir,entries})=>{
+  childRun(host,"console.log(JSON.stringify(await runMigration(host,target)));",false);
+  const input=await inspectMigration(host,target);const values=input.rows.find(row=>row.id===target.rowId)!.config as any;
+  const patch=join(dir,'cordis.patch.yml');const save=async()=>{const rows=parse(await readFile(patch,'utf8'));rows.find((row:any)=>row.id===target.rowId).config=values;await writeFile(patch,JSON.stringify(rows));};
+  values.modules.retry.enabled=false;await save();host.moduleConfig=id=>values.modules[id];
+  entries.push({id:'include:dsh-toolbox',options:{id:'dsh-toolbox',name:'dsh-toolbox'},fiber:{state:2,effectiveConfig:values}});
+  const events=new Map<string,()=>void>();host.on=(name,listener)=>{events.set(name,listener);return()=>events.delete(name);};
+  const controller=startAutomaticMigration(host,target);const keep=setInterval(()=>{},1000);
+  try {
+    await controller.settled;
+    // Native configuration persistence may precede delivery of its volatile value.
+    values.modules.retry.enabled=true;await save();values.modules.retry.enabled=false;
+    let race=true;
+    host.moduleConfig=id=>{
+      if(id==='retry'&&race){race=false;const observed={...values.modules.retry};values.modules.retry.enabled=true;events.get('loader/volatile-update')!();return observed;}
+      return values.modules[id];
+    };
+    const later=new Promise<void>(resolve=>{const off=controller.subscribe(state=>{if(state.modules.retry?.ready&&values.modules.retry.enabled){off();resolve();}});});
+    const old=await controller.retry();
+    assert.equal(old.modules.retry?.ready,false,'the disabled-owner scan must not authorize this new enable epoch');
+    await later;
+    const paths=await profilePaths(host,target.rowId);const journal=JSON.parse(await readFile(paths.journal,'utf8'));
+    assert.ok(journal.owners.retry.some((owner:string)=>owner.startsWith(process.pid+':')));
+  } finally {controller.dispose();clearInterval(keep);}
+}));
+test('true-to-true policy changes preserve ready while an ownership rescan waits for the native lock',async()=>fixture(async({host,dir,entries})=>{
+  childRun(host,"console.log(JSON.stringify(await runMigration(host,target)));",false);
+  const input=await inspectMigration(host,target);const values=input.rows.find(row=>row.id===target.rowId)!.config as any;
+  host.moduleConfig=id=>values.modules[id];entries.push({id:'include:dsh-toolbox',options:{id:'dsh-toolbox',name:'dsh-toolbox'},fiber:{state:2,effectiveConfig:values}});
+  const events=new Map<string,()=>void>();host.on=(name,listener)=>{events.set(name,listener);return()=>events.delete(name);};
+  const controller=startAutomaticMigration(host,target);const keep=setInterval(()=>{},1000);let unlock!:()=>void;let taken!:()=>void;
+  const held=new Promise<void>(resolve=>{taken=resolve;});const release=new Promise<void>(resolve=>{unlock=resolve;});let blocker:Promise<unknown>|undefined;
+  try {
+    await controller.settled;assert.equal(controller.state().modules.retry?.ready,true);
+    blocker=withProfileLock(host,async()=>{taken();await release;});await held;
+    values.modules.retry.retryEmptyResponse=true;
+    const patch=join(dir,'cordis.patch.yml');const rows=parse(await readFile(patch,'utf8'));rows.find((row:any)=>row.id===target.rowId).config=values;await writeFile(patch,JSON.stringify(rows));
+    events.get('loader/volatile-update')!();
+    assert.equal(controller.state().modules.retry?.ready,true,'policy-only notification cannot tear down the active feature or release its holds');
+    unlock();await blocker;assert.equal((await controller.retry()).modules.retry?.ready,true);
+  } finally {unlock();if(blocker)await blocker;controller.dispose();clearInterval(keep);}
+}));
+test('auto=false preserves peer conflict diagnostics ahead of config adoption messages',async()=>fixture(async({host,dir})=>{
+  const peer='dsh-toolbox-context';const path=join(dir,'node_modules',peer);await mkdir(path,{recursive:true});
+  await writeFile(join(path,'package.json'),JSON.stringify({name:peer,version:'0.1.0',dsh:{bundle:{patch:'./cordis.patch.yml'}}}));
+  await writeFile(join(path,'cordis.patch.yml'),JSON.stringify([{insert:[{id:peer,name:peer}]}]));
+  const file=join(dir,'package.json');const manifest=JSON.parse(await readFile(file,'utf8'));manifest.dependencies[peer]='*';manifest.dsh.profile.bundles.push(peer);await writeFile(file,JSON.stringify(manifest));
+  const controller=startAutomaticMigration(host,{...target,auto:false});const keep=setInterval(()=>{},1000);
+  try {const report=await controller.settled;assert.equal(report.modules.context?.phase,'conflict');assert.match(report.modules.context?.reason??'',/another Toolbox distribution/);}finally{controller.dispose();clearInterval(keep);}
 }));

@@ -19,6 +19,8 @@ export function startAutomaticMigration(host: NativeMigrationHost, options: Boot
   nativeHost.handoverAcknowledged = (id, source) => host.handoverAcknowledged?.(id, source) ?? (acknowledged !== undefined && !acknowledged.some(entry => entry.fiber && (entry.name === (source.moduleName ?? source.packageName) || entry.id === source.rowId)));
   let active: Promise<MigrationReport> | undefined;
   let refreshRequested = false;
+  const lastEnabled = new Map(options.moduleIds.map(id => [id, moduleConfigAdopted(host, options, id, { enabled: true })]));
+  const enableRevision = new Map(options.moduleIds.map(id => [id, 0]));
   let timer: ReturnType<typeof setTimeout> | undefined;
   let resolve!: (report: MigrationReport) => void;
   const settled = new Promise<MigrationReport>(done => { resolve = done; });
@@ -32,15 +34,49 @@ export function startAutomaticMigration(host: NativeMigrationHost, options: Boot
   };
   const failure = (): MigrationReport => ({ schemaVersion: 1, operationId: '', profileId: '', targetRowId: options.rowId,
     modules: Object.fromEntries(options.moduleIds.map(id => [id, { phase: 'failed', ready: false, enabled: false, reason: 'migration failed closed; inspect private journal and retry' }])), problems: ['migration could not complete safely'] });
+  const notify = () => {
+    for (const listener of listeners) { try { listener(structuredClone(state)); } catch { host.logger?.warn('Toolbox migration observer failed'); } }
+  };
+  /** Root state reads and native notifications share this synchronous admission fence. */
+  const invalidateEnabledTransitions = () => {
+    if (closed) return false;
+    let changed = false;
+    const modules = { ...state.modules };
+    for (const id of options.moduleIds) {
+      const enabled = moduleConfigAdopted(host, options, id, { enabled: true });
+      const previous = lastEnabled.get(id);
+      lastEnabled.set(id, enabled);
+      if (!enabled || previous) continue;
+      changed = true;
+      enableRevision.set(id, enableRevision.get(id)! + 1);
+      if (modules[id]?.ready) modules[id] = { ...modules[id]!, phase: 'pending', ready: false, reason: 'enabled target ownership registration pending' };
+    }
+    if (changed) {
+      state = { ...state, modules, report: state.report ? { ...state.report, modules } : undefined };
+      notify();
+    }
+    return changed;
+  };
+  const refresh = () => { if (!closed) { if (active) refreshRequested = true; else void execute(); } };
   const execute = (retry = false) => {
     if (active) return active;
+    const scannedEnableRevision = new Map(enableRevision);
     active = (options.auto === false ? dryRunMigration(host, options).then(plan => ({ schemaVersion: 1 as const, operationId: '', profileId: plan.profileId, targetRowId: options.rowId,
       modules: Object.fromEntries(plan.decisions.map(d => {
         const adopted = !!d.config && moduleConfigAdopted(host, options, d.moduleId, d.config);
         const ready = !d.source && d.phase !== 'conflict' && adopted;
-        return [d.moduleId, { phase: d.source ? 'pending' : d.phase === 'conflict' ? 'conflict' : ready ? d.phase : 'restart-required', ready, enabled: d.enabled, reason: d.source ? 'automatic migration disabled' : !adopted ? 'running Toolbox configuration has not adopted planned settings' : d.reason }];
+        return [d.moduleId, { phase: d.source ? 'pending' : d.phase === 'conflict' ? 'conflict' : ready ? d.phase : 'restart-required', ready, enabled: d.enabled, reason: d.phase === 'conflict' ? d.reason : d.source ? 'automatic migration disabled' : !adopted ? 'running Toolbox configuration has not adopted planned settings' : d.reason }];
       })), problems: plan.problems })) : runMigration(nativeHost, options, { retry }))
-      .then(publish).catch(() => { host.logger?.warn('Toolbox automatic migration failed closed; inspect and retry'); return publish(failure()); }).finally(() => { active = undefined; if (refreshRequested && !closed) { refreshRequested = false; queueMicrotask(() => { void execute(); }); } });
+      .then(report => {
+        invalidateEnabledTransitions();
+        const modules = { ...report.modules };
+        for (const id of options.moduleIds) {
+          if (scannedEnableRevision.get(id) === enableRevision.get(id)) continue;
+          refreshRequested = true;
+          if (modules[id]?.ready) modules[id] = { ...modules[id]!, phase: 'pending', ready: false, reason: 'enabled target ownership registration pending' };
+        }
+        return publish({ ...report, modules });
+      }).catch(() => { host.logger?.warn('Toolbox automatic migration failed closed; inspect and retry'); return publish(failure()); }).finally(() => { active = undefined; if (refreshRequested && !closed) { refreshRequested = false; queueMicrotask(() => { void execute(); }); } });
     return active;
   };
   const launch = () => {
@@ -61,15 +97,15 @@ export function startAutomaticMigration(host: NativeMigrationHost, options: Boot
   const unacknowledge = host.on?.('app-boot/config-reload', () => {
     // Capture synchronously at the native post-disposal event, not after an async file read.
     acknowledged = [...host.loader.entries()].map(entry => ({ id: entry.options.id, name: entry.options.name, fiber: !!entry.fiber }));
-    if (!closed) { if (active) refreshRequested = true; else void execute(); }
+    invalidateEnabledTransitions(); refresh();
   });
   const unvolatile = host.on?.('loader/volatile-update', () => {
-    if (!closed) { if (active) refreshRequested = true; else void execute(); }
+    invalidateEnabledTransitions(); refresh();
   });
   const unready = host.appReady?.onReady(launch);
   if (!host.appReady) launch();
   return {
-    state: () => structuredClone(state),
+    state: () => { if (invalidateEnabledTransitions()) refresh(); return structuredClone(state); },
     subscribe(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     settled,
     inspect: () => dryRunMigration(host, options),

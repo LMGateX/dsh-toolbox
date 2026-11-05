@@ -61,7 +61,7 @@ export function createToolboxPlugin(distribution: Distribution) {
             if (closed) return;
           }
           if (!allowed) {
-            statuses[id] = !enabled ? {phase: 'disabled'} : {
+            statuses[id] = !enabled && handover?.phase !== 'conflict' && handover?.phase !== 'failed' ? {phase: 'disabled'} : {
               phase: handover?.phase === 'conflict' ? 'conflict' : handover?.phase === 'failed' ? 'failed' : 'migration-pending',
               reason: handover?.reason ?? 'Waiting for safe migration and ownership discovery.',
             };

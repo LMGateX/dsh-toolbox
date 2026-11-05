@@ -843,6 +843,7 @@ export function createChimeAdapter(React: ReactRuntime) {
           stopCurrent?.()
           return new Promise<void>(resolve => {
             if (disposed) { resolve(); return }
+            let cleanup = () => resolve()
             const spec = __CHIME_SOUNDS[id]
             if (spec === undefined || windowMs <= 0) {
               resolve()
@@ -877,6 +878,7 @@ export function createChimeAdapter(React: ReactRuntime) {
               stopCurrent?.()
               const settings = readSettings()
               const gain = audio.createGain()
+              cleanup = () => { try { gain.disconnect() } catch {} resolve() }
               gain.gain.value = Math.max(0, Math.min(1, settings.volume))
               gain.connect(audio.destination)
               let cancelled = false
@@ -903,6 +905,8 @@ export function createChimeAdapter(React: ReactRuntime) {
                 resolve()
               }
               stopCurrent = finish
+              cleanup = finish
+              const safeStep = () => { try { step() } catch { finish() } }
               const step = (): void => {
                 if (cancelled) return
                 const remainingMs = deadline - Date.now()
@@ -916,10 +920,10 @@ export function createChimeAdapter(React: ReactRuntime) {
                 source.connect(gain)
                 source.start(0, 0, sliceSeconds)
                 const nextMs = sliceSeconds * 1000 + REPEAT_GAP_SECONDS * 1000
-                timer = setTimeout(remainingMs > nextMs ? step : finish, remainingMs > nextMs ? nextMs : remainingMs + 20)
+                timer = setTimeout(remainingMs > nextMs ? safeStep : finish, remainingMs > nextMs ? nextMs : remainingMs + 20)
               }
-              step()
-            })()
+              safeStep()
+            })().catch(() => cleanup())
           })
         },
       }
@@ -1764,7 +1768,10 @@ export function createChimeAdapter(React: ReactRuntime) {
     const owned = ownScope(parent);
     const ctx = owned.ctx;
     let mounted = true;
+    let cleanupFailure = () => {};
+    try {
       const audio = createAudio(() => settingsOf(form.getSnapshot().value))
+      cleanupFailure = () => audio.dispose()
       let latest: ChimeSettings = settingsOf(form.getSnapshot().value)
       /** The sidebar switch reads this flag instead of the whole settings object. */
       const restFlag = createFlag(booleanOf(form.getSnapshot().value, 'restMode', false))
@@ -1845,6 +1852,7 @@ export function createChimeAdapter(React: ReactRuntime) {
         },
       })
 
+      cleanupFailure = () => { watcher.dispose(); stopRing(); audio.dispose() }
       ctx.effect(() => {
         const list = ctx.sessions.list
         const pump = (): void => watcher.update(list.getSnapshot())
@@ -2033,8 +2041,14 @@ export function createChimeAdapter(React: ReactRuntime) {
       stopRing();
       audio.dispose();
       if (preview === ownPreview) preview = undefined;
-      owned.dispose();
+      return owned.dispose();
     };
+    } catch (error) {
+      mounted = false;
+      cleanupFailure();
+      void owned.dispose();
+      throw error;
+    }
   }
   return { mount, createView, createWatcher, createEditor, createAudio, isSettled, settingsOf, parseDuration, parseVolume, parseClock, inQuietHours, effectiveWindowMs, chimeSound, checkTime, shouldStopOnGesture, gestureStopsRing, PLACEMENTS, ROW_ID, FIELDS: FIELDS.map(field => field.key), SOUND_IDS: Object.keys(__CHIME_SOUNDS), inject: ['slots','configForms','sessions'] };
 }

@@ -57,6 +57,7 @@ export function createStatusStore(rowId: string, environment?: Partial<StatusEnv
     return next;
   }
   async function pump(token: number): Promise<void> {
+    if (!live || token !== generation) return;
     controller = new AbortController();
     const thisController = controller;
     const deadline = env.setTimer(() => thisController.abort(), 2500);

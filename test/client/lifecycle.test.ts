@@ -122,3 +122,51 @@ test('status transport failure closes previously ready capability and disposal c
   c.next(); await flush(); stop(); resolve({ ok: true, json: async () => ({ modules: { chime: { ready: true, enabled: true, phase: 'active' } } }) }); await flush();
   assert.equal(s.getSnapshot().modules.chime, undefined); assert.equal(c.timers.size, 0);
 });
+
+test('partially mounted chime rolls back listeners, watches, and gestures when slots fail', async () => {
+  let subscriptions = 0; let gestures = 0;
+  (globalThis as any).window = { addEventListener() { gestures++; }, removeEventListener() { gestures--; } };
+  const form: any = { getSnapshot: () => ({ status: 'ready', writable: true, revision: 0, value: {} }), subscribe() { subscriptions++; return () => subscriptions--; }, mutate: async () => true };
+  const ctx: any = {
+    effect: (fn: Function) => fn(), inject: () => ({ dispose() {} }), get: () => undefined,
+    sessions: { list: { getSnapshot: () => ({ ids: [], byId: {} }), subscribe() { subscriptions++; return () => subscriptions--; } } },
+    slots: { inject() { throw new Error('slot unavailable'); } },
+  };
+  assert.throws(() => api.mount(ctx, form), /slot unavailable/);
+  await flush(); assert.equal(subscriptions, 0); assert.equal(gestures, 0);
+});
+
+for (const failure of ['gain','source']) test('audio graph exception settles ring and disconnects: ' + failure, {timeout:1000}, async () => {
+  let disconnected = 0;
+  (globalThis as any).window = { AudioContext: class {
+    state = 'running'; destination = {};
+    close() { return Promise.resolve(); }
+    decodeAudioData() { return Promise.resolve({duration:0.5}); }
+    createGain() { if (failure === 'gain') throw new Error('gain failed'); return { gain: { value: 0 }, connect() {}, disconnect() { disconnected++; } }; }
+    createBufferSource() { throw new Error('source failed'); }
+  } };
+  const audio = api.createAudio(() => api.settingsOf({}));
+  await audio.play('chime-soft', 1000); audio.dispose();
+  assert.equal(disconnected, failure === 'gain' ? 0 : 1);
+});
+
+test('status retained timer callback does not fetch after disposal or a new generation', async () => {
+  const c = clock(); let requests = 0;
+  const s = createStatusStore('row', { ...c, legacyAtBoot: false, fetch: (async () => { requests++; return { ok:true,json:async()=>({modules:{}}) }; }) as any });
+  const stop = s.start(); await flush(); const stale = [...c.timers.values()][0]!;
+  stop(); stale(); await flush(); assert.equal(requests, 1);
+  const stopAgain = s.start(); await flush(); stale(); await flush(); assert.equal(requests, 2); stopAgain();
+});
+
+test('scope joins native Fiber cleanup and continues after a throwing disposer', async () => {
+  const { ownScope } = await import('../../client/scope.ts');
+  const calls: string[] = [];
+  let finish: () => void = () => {};
+  const scope = ownScope({ effect: (fn: Function) => fn(), inject: (_names: readonly string[], _callback: Function) => ({ dispose() { calls.push('fiber'); return new Promise<void>(resolve => finish = resolve); } }) });
+  scope.ctx.effect(() => () => { calls.push('last'); });
+  scope.ctx.effect(() => () => { calls.push('throw'); throw new Error('teardown failed'); });
+  scope.ctx.inject([], () => {});
+  const pending = scope.dispose(); let settled = false; pending.then(() => settled = true);
+  assert.deepEqual(calls, ['fiber','throw','last']); await flush(); assert.equal(settled, false);
+  finish(); await pending; assert.equal(settled, true); await scope.dispose(); assert.equal(calls.length, 3);
+});

@@ -12,3 +12,9 @@ No amendments at specification freeze.
 
 **Acceptance addition (not a reduction).** Exercise actual native Agent scope composition with two isolated backend/policy instances, canonical tool visibility, per-agent dispatch, status/pressure, live settings and unload. Re-run the full native stock-web packed-client/configuration acceptance against the corrected adapter. No automatic preset/profile edits are introduced.
 
+
+## 2026-11-06 — Direct user prohibition of GitHub Actions
+
+The user explicitly instructed “禁止使用 github action”. This supersedes the original release-gate reference to CI. Repository Actions are disabled, existing in-progress runs are cancelled if any, and all GitHub workflow definitions are removed. No further GitHub Actions execution, dispatch, or release workflow is permitted.
+
+The replacement release evidence is the complete locally executed isolated source/type/native/browser/packed-artifact suite, independent review rechecks, unchanged production-profile/source integrity, an annotated matching tag and direct authenticated `gh` publication/download/checksum verification. Public Git storage and GitHub Releases remain authorized; no npm publication or production-profile installation is added.

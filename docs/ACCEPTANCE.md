@@ -22,4 +22,4 @@ Every row is mandatory for 0.1.0 unless explicitly identified as an exceptional 
 | HOST-1 | Baseline native host composition and lifecycle run in disposable HOME/profile/process; packed artifacts consumed rather than live sources alone. |
 | CLIENT-1 | Actual emitted client loads in isolated browser/harness; settings persistence/toggles and no duplicate chime handover are exercised. |
 | SAFE-1 | Original source repos remain unchanged; active profile hashes unchanged; no local production installation or live GUI mutation. |
-| PUB-1 | Public GitHub repository, clean committed main, CI, matching tag, release assets and SHA256SUMS verified remotely. |
+| PUB-1 | Public GitHub repository, clean committed main, complete local isolated acceptance (no GitHub Actions, per direct user override in AMENDMENTS), matching annotated tag, release assets and SHA256SUMS verified remotely. |

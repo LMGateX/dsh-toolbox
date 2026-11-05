@@ -15,7 +15,7 @@ Status: **acceptance in progress; not yet a published-release receipt**. Target 
 | First whole source/native/browser pass | `DSH_TOOLBOX_CHROMIUM=/path/to/chromium npm run check`: 273 tests passed, zero failed/skipped; TypeScript and all five builds passed. This precedes later review fixes and is not the final release result. |
 | First five packed consumers | `npm run pack && npm run test:artifacts`: five tarballs installed in clean npm consumers; checksum, selected payloads, actual ESM imports and CLI help passed, 5/5. |
 | Native root integration | `npm run typecheck && node --test test/integration/*.test.ts`: 15/15 passed, zero skipped after raw Cordis fiber identity and current module enablement fixes. Includes actual Loader volatile updates, captured retry streams, preserved/released owned goal holds and completed native next round, service isolation, asynchronous disposer joining, SettingsForms describe/update, authenticated cookie/Host/Origin admission and conflict diagnostics. SettingsForms unit integration uses an explicitly named Loader-backed ConfigEditor adapter; full disk persistence belongs to the separate packed-web gate. |
-| Public Linux CI checkpoint | [Verify 42061582667](<https://github.com/LMGateX/dsh-toolbox/actions/runs/42061582667>) succeeded at `0d00b974b7eebbdbcc39f790d066441bf3bdf7f9`. Later fixes require a new final run. |
+| GitHub Actions prohibition | Direct user instruction supersedes the former CI requirement. Actions are disabled and workflow files removed; final evidence is local isolated acceptance plus direct `gh` release verification, never another Actions run. |
 
 ## Review and regression gates
 

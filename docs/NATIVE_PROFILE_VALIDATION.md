@@ -48,6 +48,7 @@ d358d3072a076433d093fa4ee7fd40e4a3ca46cb079af1a06ad1806c02efc399  dsh-toolbox-go
 After dependencies, pnpm and Chromium are available:
 
 ```sh
+npm run check
 npm run pack
 node --test test/artifacts/native-profile.test.ts
 ```

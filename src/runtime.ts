@@ -46,11 +46,11 @@ export function createToolboxPlugin(distribution: Distribution) {
 
       const reconcile = async () => {
         if (closed) return;
-        const migration = controller.state();
         for (const id of distribution.moduleIds) {
           if (closed) return;
           const values = moduleConfig(id);
-          const handover = migration.modules[id];
+          // A previous sibling may have awaited asynchronous disposal. Never reuse its admission snapshot.
+          const handover = controller.state().modules[id];
           const enabled = values.enabled !== false;
           const allowed = handover?.ready === true && enabled;
           const current = scopes.get(id);

@@ -75,6 +75,7 @@ test('native CLI installs packed combined distribution into isolated web profile
   assert.equal(await page.locator('[data-module]').count(),4);
   const moduleStatus=await page.evaluate(async()=>{const response=await fetch('/toolbox/dsh-toolbox/status',{credentials:'same-origin',cache:'no-store'});return {code:response.status,body:await response.json()};});
   assert.equal(moduleStatus.code,200);assert.equal(moduleStatus.body.modules.chime.ready,true);
+  assert.equal(moduleStatus.body.modules.context.phase,'active','context adapter activates without a global engine in stock web presets');
   assert.deepEqual(Object.keys(moduleStatus.body.modules).sort(),['chime','context','goalWait','retry']);
   console.log('Native module phases:',Object.fromEntries(Object.entries(moduleStatus.body.modules).map(([id,value])=>[id,(value as any).phase])));
   const delay=page.locator('[data-module="context"] [data-field="retryDelayMs"]');

@@ -1,0 +1,10 @@
+node_modules/
+lib/
+dist/
+artifacts/
+.sandbox/
+coverage/
+*.tgz
+.agents/
+playwright-report/
+test-results/

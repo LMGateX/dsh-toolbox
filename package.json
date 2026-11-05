@@ -1,0 +1,34 @@
+{
+  "name": "dsh-toolbox",
+  "version": "0.1.0",
+  "description": "Modular DSH enhancements with safe automatic legacy migration",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": "0.2.2-alpha.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LMGateX/dsh-toolbox.git"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/**/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build",
+    "pack": "node scripts/pack.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3",
+    "esbuild": "^0.25.12",
+    "@deepseek-ai/dsh": "0.2.2-alpha.3",
+    "@playwright/test": "^1.56.1"
+  }
+}

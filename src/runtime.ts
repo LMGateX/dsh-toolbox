@@ -93,7 +93,9 @@ export function createToolboxPlugin(distribution: Distribution) {
             const input: Record<string, unknown> = {};
             const fields = (plugin.Config as Schemastery<any>).dict ?? {};
             for (const key of Object.keys(fields)) Object.defineProperty(input, key, {enumerable: true, get: () => running.values[key]});
-            const fiber = ctx.plugin({name: plugin.name, inject: plugin.inject, apply: plugin.apply} as Plugin, input);
+            const mounted = ctx.plugin({name: plugin.name, inject: plugin.inject, apply: plugin.apply} as Plugin, input);
+            // ctx.plugin returns a thenable facade; native event filters compare the raw fiber.
+            const fiber = mounted.ctx.fiber;
             running.fiber = fiber;
             scopes.set(id, running);
             setFiberState(id, fiber);

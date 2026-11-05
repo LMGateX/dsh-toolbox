@@ -25,12 +25,13 @@ Two independent, fresh-context read-only reviews compared the frozen-document ba
 
 Read-only verification after implementation confirms original source HEADs and working-tree status match their initial observations. Context `22173d1`, retry `c100ff3`, chime `88f17e3` remain clean. Conventional gate `62662dc` retains only its pre-existing README/untracked research/patch-check changes. No source repository was built or installed.
 
-Active web profile SHA-256 values remain unchanged:
+The active web profile dependency manifest and lockfile still match their initial SHA-256 values. A late read-only audit found configuration-patch drift (mtime 2026-11-06 00:38:58 +08:00); its origin was not established. It was neither overwritten nor restored. The patch contains no Toolbox row and the profile contains no Toolbox migration journal. This is not a claim that the complete active profile remained byte-identical. Initial/current audit digests are:
 
 ```text
 package.json       4eec5020679e926d320b072d95baa1fd9f92a48903892a9d0c6eba25915e8b68
 pnpm-lock.yaml     4db34901144ecea0041c587b8b9579b9cc54fe16ff0c64993d8b899a2fcf07ad
-cordis.patch.yml   2047ef0ae4094db168c61f05ad66cc4744a3c10f5e6a97c28616ad733933c22a
+cordis.patch.yml initial  2047ef0ae4094db168c61f05ad66cc4744a3c10f5e6a97c28616ad733933c22a
+cordis.patch.yml current  0a791d146d1066158dba0627fd3253e7aa89474a9e36694dfc8fe39634fef118
 ```
 
 The live GUI was not a test target. Nothing was installed into the production profile. Final source-suite, native packed-web, review recheck, tag and remotely downloaded release checksum evidence is pending below.

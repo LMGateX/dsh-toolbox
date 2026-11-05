@@ -26,6 +26,10 @@ The host may recompose during configuration writes; the process must be restarta
 
 Repeated starts do not reimport or override later Toolbox changes. Resume an interrupted journal only after validating profile identity and current hashes. Provide inspect/dry-run, retry and selective rollback/recovery. Rollback reverses only owned changes whose current values still match the migration's recorded writes; preserve unrelated later edits and refuse conflicting restoration. Turning Toolbox off does not silently reactivate legacy plugins. Explicit recovery is the path back.
 
+Every false→true runtime enablement first withdraws cached readiness synchronously, then persists the current per-module host process registration before re-admission. A stale asynchronous scan and a pre-await sibling-disposal snapshot cannot authorize activation. Policy-only enabled→enabled edits retain existing feature fibers and held authority.
+
+Recovery first disables the new module, then waits for every recorded owning process to stop. A CLI-created journal with no later runtime owner can recover after its CLI exits. Before each legacy restoration and each interrupted-recovery write, fresh discovery rechecks overlapping selected/live/durably recorded peer owners, source identity and hashes, overlays, expressions and ambiguity. Conflicted capabilities remain disabled while independently valid requested capabilities may restore. Only owned deltas are replayed; unrelated later peer edits are preserved. Journals missing required provenance fail closed rather than guessing.
+
 ## Boundaries
 
 Never scan every profile, uninstall dependencies, edit package stores, force a restart, rearm externally disarmed goals, silently replace experimental startup owners, or report a mere file save as an active handover. Permission errors, dynamic overlays, multiple conflicting instances and malformed files produce actionable reports. Release only after interruption/concurrency/unload/native-integration acceptance tests pass.

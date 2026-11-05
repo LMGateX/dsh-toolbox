@@ -24,6 +24,9 @@ export interface Source { moduleId: ModuleId; packageName: string; moduleName?: 
 export interface Discovery {
   profileId: string; profile: ProfileFacts; revision: string; manifest: Values; patchText: string; manifestText: string;
   moduleProblems?: Partial<Record<ModuleId, string[]>>;
+  /** Detached immutable input evidence, including absent optional files. */
+  inputFiles?: { path: string; hash: string | null }[];
+  environmentIdentity?: string;
   rows: Values[]; sources: Source[]; target: Distribution; explicit: Partial<Record<ModuleId, Values>>;
   peers: Partial<Record<ModuleId, string[]>>; problems: string[]; legacyMode: boolean;
 }

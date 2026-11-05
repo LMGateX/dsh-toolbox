@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
+import { rollbackMigration } from '../../src/migration/engine.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -30,8 +32,9 @@ async function fixture(t: TestContext) {
   ctx.baseUrl = pathToFileURL(dir).href + '/';
   const controllers: MigrationController[] = [];
   const allowStop = deferred();
+  const targetAllowStop = deferred();
   t.after(async () => {
-    allowStop.resolve(); for (const controller of controllers) controller.dispose();
+    allowStop.resolve(); targetAllowStop.resolve(); for (const controller of controllers) controller.dispose();
     await ctx.fiber.dispose();
     if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
     if (oldDsh === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = oldDsh;
@@ -52,7 +55,7 @@ async function fixture(t: TestContext) {
   const profile = { dir, home: dshHome, patchPath, installAnchor: anchor, overlays: [] };
   const proof = {
     events: [] as string[], oldActive: 0, targetActive: 0, returned: 0,
-    stopStarted: deferred(), allowStop, controllers,
+    stopStarted: deferred(), allowStop, targetStopStarted: deferred(), targetAllowStop, controllers,
     module: undefined as Values | undefined,
     bootstrap(_pluginContext: unknown, config: Values) {
       proof.module = (config.modules as Record<string, Values>)?.retry;
@@ -99,9 +102,9 @@ async function fixture(t: TestContext) {
     "      active = true; proof.targetActive++; proof.events.push('target-feature-start');",
     '    }',
     '  });',
-    "  ctx.effect(() => () => {",
+    "  ctx.effect(() => async () => {",
     '    unsubscribe(); controller.dispose();',
-    "    if (active) { proof.targetActive--; proof.events.push('target-feature-stop'); }",
+    "    if (active) { proof.targetStopStarted.resolve(); await proof.targetAllowStop.promise; proof.targetActive--; proof.events.push('target-feature-stop'); }",
     '  });',
     "  proof.returned++; proof.events.push('target-apply-return');",
     '}',
@@ -200,4 +203,30 @@ test('actual native HMR file watcher serializes persisted profile reload and own
   assert.equal(applied.modules.retry?.phase, 'applied');
   assert.equal(f.proof.oldActive, 0); assert.equal(f.proof.targetActive, 1);
   assert.ok(f.proof.events.indexOf('source-stopped') < f.proof.events.indexOf('target-feature-start'));
+});
+test('real native host B remains the rollback owner while its async Toolbox disposer is absent from Loader inventory', {timeout:15_000},async t=>{
+  const f=await fixture(t);const keep=setInterval(()=>{},1000);t.after(()=>clearInterval(keep));
+  // A performs a genuinely offline migration and exits before native host B starts its target.
+  const script="import {runMigration} from "+JSON.stringify(new URL('../../src/migration/engine.ts',import.meta.url).href)+";const host={profileContext:"+JSON.stringify(f.host.profileContext)+",loader:{entries:()=>[]}};console.log(JSON.stringify(await runMigration(host,"+JSON.stringify(target)+")));";
+  const child=spawnSync(process.execPath,['--input-type=module','-e',script],{env:{...process.env},encoding:'utf8'});
+  assert.equal(child.status,0,child.stderr);const migrated=JSON.parse(child.stdout);
+  await f.mount();const controller=f.proof.controllers.at(-1)!;
+  await controller.settled;
+  assert.equal(controller.state().modules.retry?.ready,true);
+  assert.equal(f.proof.targetActive,1);assert.equal(f.proof.oldActive,0);
+  const first=await controller.rollback({operationId:migrated.operationId,modules:['retry']});
+  assert.equal(first.modules.retry?.phase,'restart-required');
+  const entry=[...f.ctx.loader.entries()].find((entry:any)=>entry.options.id==='dsh-toolbox')!;
+  // Native remove detaches the entry before its owned asynchronous disposer settles.
+  f.ctx.loader.remove(entry.id);
+  await f.proof.targetStopStarted.promise;
+  assert.ok(![...f.ctx.loader.entries()].some((entry:any)=>entry.options.id==='dsh-toolbox'));
+  assert.equal(f.proof.targetActive,1,'new effect is still alive during pending native teardown');
+  const repeated=await rollbackMigration(f.host,target,{operationId:migrated.operationId,modules:['retry']});
+  assert.equal(repeated.modules.retry?.phase,'restart-required');
+  const manifest=JSON.parse(await readFile(join(f.dir,'package.json'),'utf8'));
+  assert.ok(!manifest.dsh.profile.bundles.includes('dsh-stream-retry'));
+  assert.equal(f.proof.oldActive,0,'old source is not restored while B still owns its pending new effect');
+  f.proof.targetAllowStop.resolve();await entry.fiber.await();
+  assert.equal(f.proof.targetActive,0);
 });

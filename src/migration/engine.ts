@@ -3,12 +3,13 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { isMap, isSeq, parseDocument } from 'yaml';
 import { inspectMigration } from './discovery.ts';
-import { containsExpression, isRecord, planMigration } from './planner.ts';
-import { profilePaths, readOptional, withProfileLock, writePrivate } from './storage.ts';
+import { containsExpression, isRecord, planMigration, validateKnownConfig } from './planner.ts';
+import { digest, profilePaths, readOptional, withProfileLock, writePrivate } from './storage.ts';
 import type { Decision, Discovery, Distribution, MigrationPlan, MigrationReport, ModuleId, NativeMigrationHost, Values } from './types.ts';
 
 interface Step { kind: 'target' | 'disable' | 'bundles'; before: string; after: string; done: boolean }
-interface Journal { schemaVersion: 1; operationId: string; profileId: string; targetRowId: string; runtimeObserved?: boolean; browserFenceFinalized?: boolean; browserReloadAfter?: number; origin: string; phase: 'prepared' | 'saved'; plan: MigrationPlan; steps: Step[]; backup: string; previous: Partial<Record<ModuleId, unknown>>; rollback?: Partial<Record<ModuleId, { origin: string; done: boolean }>>; recoveryWrites?: { patchBefore: string; patchAfter: string; manifestBefore: string; manifestAfter: string } }
+interface JournalEnvironment { identity: string; files: { path: string; hash: string | null }[]; paths: string[] }
+interface Journal { environment?: JournalEnvironment; ownershipVersion?: 1; owners?: Partial<Record<ModuleId, string[]>>; schemaVersion: 1; operationId: string; profileId: string; targetRowId: string; runtimeObserved?: boolean; browserFenceFinalized?: boolean; browserReloadAfter?: number; origin: string; phase: 'prepared' | 'saved'; plan: MigrationPlan; steps: Step[]; backup: string; previous: Partial<Record<ModuleId, unknown>>; rollback?: Partial<Record<ModuleId, { origin: string; done: boolean }>>; recoveryWrites?: { patchBefore: string; patchAfter: string; manifestBefore: string; manifestAfter: string } }
 /** Stable across HMR but different after a genuine process restart, without process-global state. */
 const processOrigin = () => process.pid + ':' + performance.timeOrigin;
 const document = (text: string) => {
@@ -69,6 +70,48 @@ async function loadJournal(host: NativeMigrationHost, target: Distribution): Pro
   if (value.schemaVersion !== 1 || value.targetRowId !== target.rowId || !Array.isArray(value.steps)) throw new Error('unrecognized migration journal');
   return value;
 }
+function journalEnvironment(input: Discovery): JournalEnvironment {
+  if (!input.environmentIdentity || !input.inputFiles) throw new Error('immutable discovery input evidence unavailable');
+  const writable = new Set([join(input.profile.dir, 'package.json'), input.profile.patchPath]);
+  return { identity: input.environmentIdentity, files: input.inputFiles.filter(file => !writable.has(file.path)), paths: input.inputFiles.map(file => file.path) };
+}
+/** Validate every participating input, not merely the two profile documents we own. */
+async function validateJournalInputs(host: NativeMigrationHost, target: Distribution, journal: Journal): Promise<Discovery> {
+  const current = await inspectMigration(host, target);
+  const evidence = journal.environment;
+  if (!evidence || !current.environmentIdentity || !current.inputFiles) throw new Error('journal has no immutable input evidence; unsafe retry refused');
+  if (current.profileId !== journal.profileId || current.environmentIdentity !== evidence.identity) throw new Error('migration environment identity changed');
+  const knownPaths = new Set(evidence.paths);
+  if (current.inputFiles.some(file => !knownPaths.has(file.path))) throw new Error('migration input resolution changed');
+  for (const file of evidence.files) {
+    const value = await readOptional(file.path);
+    if ((value === null ? null : digest(value)) !== file.hash) throw new Error('migration environment input changed');
+  }
+  // An interrupted write may be at its recorded before OR after image, never an arbitrary earlier stage.
+  const paths = await profilePaths(host, target.rowId);
+  const firstPending = journal.steps.findIndex(step => !step.done);
+  const allowed = new Map<string, Set<string>>();
+  for (let i = 0; i < journal.steps.length; i++) {
+    const step = journal.steps[i]!;
+    const path = step.kind === 'bundles' ? paths.manifest : paths.patch;
+    if (!allowed.has(path)) allowed.set(path, new Set([step.before]));
+    if (step.done) {
+      if (firstPending >= 0 && i > firstPending) throw new Error('journal step ordering is invalid');
+      allowed.set(path, new Set([step.after]));
+    } else if (i === firstPending) allowed.get(path)!.add(step.after);
+  }
+  for (const [path, values] of allowed) if (!values.has(await readOptional(path) ?? '')) throw new Error('concurrent profile edit; migration paused without overwrite');
+  if (current.problems.length) throw new Error('current profile ownership cannot be validated');
+  for (const decision of journal.plan.decisions) {
+    if (decision.phase === 'conflict') continue;
+    if (current.moduleProblems?.[decision.moduleId]?.length || current.peers[decision.moduleId]?.length) throw new Error('current module ownership changed');
+    const sources = current.sources.filter(source => source.moduleId === decision.moduleId);
+    if (sources.some(source => source.problem) || sources.length !== (decision.source ? 1 : 0)) throw new Error('current legacy ownership changed');
+    if (decision.source && (sources[0]!.packageName !== decision.source.packageName || sources[0]!.version !== decision.source.version || (sources[0]!.moduleName ?? sources[0]!.packageName) !== (decision.source.moduleName ?? decision.source.packageName))) throw new Error('current legacy identity or version changed');
+    if (decision.config) { validateKnownConfig(decision.moduleId, decision.config); target.validateModule?.(decision.moduleId, decision.config); }
+  }
+  return current;
+}
 function liveLegacy(host: NativeMigrationHost, decision: Decision): boolean {
   if (!decision.source) return false;
   return [...host.loader.entries()].some(entry => (entry.options.name === (decision.source!.moduleName ?? decision.source!.packageName) || entry.options.id === decision.source!.rowId) && !!entry.fiber && (entry.fiber.state !== undefined || !!entry.fiber.inertia));
@@ -79,16 +122,48 @@ function plain(value: unknown): unknown {
   if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, plain(child)]));
   return value;
 }
-function runningConfigMatches(host: NativeMigrationHost, journal: Journal, decision: Decision, current?: Discovery): boolean {
-  const target = [...host.loader.entries()].find(entry => entry.options.id === journal.targetRowId && entry.options.name === (journal.plan.target.packageName ?? journal.targetRowId));
-  const root = plain(target?.fiber?.effectiveConfig);
+function runningModuleConfig(host: NativeMigrationHost, target: Distribution, id: ModuleId): Values | undefined {
+  const entry = [...host.loader.entries()].find(value => value.options.id === target.rowId && value.options.name === (target.packageName ?? target.rowId));
+  const root = plain(entry?.fiber?.effectiveConfig);
   const modules = isRecord(root) && isRecord(root.modules) ? root.modules : {};
-  const actual = host.moduleConfig?.(decision.moduleId) ?? modules[decision.moduleId];
+  const value = host.moduleConfig?.(id) ?? modules[id];
+  return isRecord(value) ? value : undefined;
+}
+export function moduleConfigAdopted(host: NativeMigrationHost, target: Distribution, id: ModuleId, desired: Values): boolean {
+  const actual = runningModuleConfig(host, target, id);
+  return !!actual && Object.entries(desired).every(([key, value]) => isDeepStrictEqual(actual[key], value));
+}
+function runningConfigMatches(host: NativeMigrationHost, journal: Journal, decision: Decision, current?: Discovery): boolean {
   const row = current?.rows.find(value => value.id === journal.targetRowId);
   const desiredRoot = isRecord(row?.config) ? row.config : {};
   const desiredModules = isRecord(desiredRoot.modules) ? desiredRoot.modules : {};
   const desired = desiredModules[decision.moduleId] ?? decision.config;
-  return isRecord(actual) && isRecord(desired) && Object.entries(desired).every(([key, value]) => isDeepStrictEqual(actual[key], value));
+  return isRecord(desired) && moduleConfigAdopted(host, journal.plan.target, decision.moduleId, desired);
+}
+/** Register before any ready result can authorize mounting; keep previous owners until proven exited. */
+async function observeOwners(host: NativeMigrationHost, journal: Journal, current: Discovery): Promise<void> {
+  if (journal.ownershipVersion !== 1) return;
+  const target = [...host.loader.entries()].find(entry => entry.options.id === journal.targetRowId && entry.options.name === (journal.plan.target.packageName ?? journal.targetRowId));
+  if (!target?.fiber) return; // A CLI process is not a target runtime owner.
+  let changed = journal.runtimeObserved !== true;
+  journal.runtimeObserved = true;
+  journal.owners ??= {};
+  for (const decision of journal.plan.decisions) {
+    if (!decision.config || decision.phase === 'conflict' || journal.rollback?.[decision.moduleId]?.done) continue;
+    const actual = runningModuleConfig(host, journal.plan.target, decision.moduleId);
+    const requested = current.explicit[decision.moduleId]?.enabled ?? decision.enabled;
+    // Disabled startup owns no feature. An unknown config with an enabled request is conservative.
+    if (actual?.enabled === false || actual?.enabled !== true && requested !== true) continue;
+    const owners = journal.owners[decision.moduleId] ??= [];
+    if (!owners.includes(processOrigin())) { owners.push(processOrigin()); changed = true; }
+  }
+  if (changed) {
+    const paths = await profilePaths(host, journal.targetRowId);
+    await writePrivate(paths.journal, JSON.stringify(journal) + '\n');
+  }
+}
+function hasLiveOwners(journal: Journal, id: ModuleId): boolean {
+  return (journal.owners?.[id] ?? []).some(owner => !originExited(owner));
 }
 /** Observe actual native ownership; persisted values are never proof of live application. */
 export function reportJournal(host: NativeMigrationHost, journal: Journal, current?: Discovery): MigrationReport {
@@ -102,7 +177,7 @@ export function reportJournal(host: NativeMigrationHost, journal: Journal, curre
     if (!decision.source && current?.sources.some(source => source.moduleId === id && !source.disabled)) { modules[id] = { phase: 'conflict', ready: false, enabled, reason: 'new legacy ownership was added after migration' }; continue; }
     if (decision.phase === 'conflict') { modules[id] = { phase: 'conflict', ready: false, enabled: false, reason: decision.reason }; continue; }
     if (journal.phase !== 'saved') { modules[id] = { phase: 'prepared', ready: false, enabled, reason: 'migration interrupted; retry validates durable steps' }; continue; }
-    if (decision.source && !runningConfigMatches(host, journal, decision, current)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'running Toolbox configuration has not adopted imported settings' }; continue; }
+    if (decision.config && !runningConfigMatches(host, journal, decision, current)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'running Toolbox configuration has not adopted imported settings' }; continue; }
     if (decision.source && journal.origin === processOrigin() && !host.handoverAcknowledged?.(id, decision.source)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'native post-disposal configuration acknowledgment required' }; continue; }
     if (decision.source && journal.origin !== processOrigin() && journal.runtimeObserved && !originExited(journal.origin)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'original profile host is still alive or cannot be verified stopped' }; continue; }
     if (decision.source && liveLegacy(host, decision)) { modules[id] = { phase: 'restart-required', ready: false, enabled, reason: 'legacy runtime has not stopped' }; continue; }
@@ -121,6 +196,7 @@ export async function runMigration(host: NativeMigrationHost, target: Distributi
     let journal = await loadJournal(host, target);
     if (journal && journal.profileId !== input.profileId) throw new Error('journal belongs to another profile');
     if (journal?.phase === 'saved') {
+      await observeOwners(host, journal, input);
       // Finalize the page fence only on a genuinely fresh host, never a page opened during the old handover.
       if (journal.browserReloadAfter && !journal.browserFenceFinalized && performance.timeOrigin >= journal.browserReloadAfter && [...host.loader.entries()].some(entry => entry.options.id === target.rowId && !!entry.fiber) && (!journal.runtimeObserved || originExited(journal.origin))) {
         journal.browserReloadAfter = performance.timeOrigin;
@@ -140,7 +216,7 @@ export async function runMigration(host: NativeMigrationHost, target: Distributi
       const operationId = randomUUID();
       const rendered = renderSteps(input, plan, operationId);
       const backup = join(paths.root, operationId + '.backup.json');
-      journal = { schemaVersion: 1, operationId, profileId: input.profileId, targetRowId: target.rowId, runtimeObserved: [...host.loader.entries()].some(entry => entry.options.id === target.rowId && !!entry.fiber), browserReloadAfter: plan.decisions.some(d => d.moduleId === 'chime' && d.source && d.phase === 'prepared') ? Date.now() : undefined, origin: processOrigin(), phase: 'prepared', plan: { ...plan, target: { ...target, validateModule: undefined } }, steps: rendered.steps, previous: rendered.previous, backup };
+      journal = { schemaVersion: 1, operationId, profileId: input.profileId, targetRowId: target.rowId, runtimeObserved: [...host.loader.entries()].some(entry => entry.options.id === target.rowId && !!entry.fiber), browserReloadAfter: plan.decisions.some(d => d.moduleId === 'chime' && d.source && d.phase === 'prepared') ? Date.now() : undefined, origin: processOrigin(), phase: 'prepared', environment: journalEnvironment(input), ownershipVersion: 1, owners: {}, plan: { ...plan, target: { ...target, validateModule: undefined } }, steps: rendered.steps, previous: rendered.previous, backup };
       await options.checkpoint?.('before-backup');
       await writePrivate(backup, JSON.stringify({ schemaVersion: 1, profileId: input.profileId, manifest: input.manifestText, patch: input.patchText }) + '\n');
       await options.checkpoint?.('after-backup');
@@ -148,12 +224,16 @@ export async function runMigration(host: NativeMigrationHost, target: Distributi
       await options.checkpoint?.('after-journal');
       if ((await inspectMigration(host, target)).revision !== input.revision) throw new Error('profile changed before migration commit');
     }
+    await validateJournalInputs(host, target, journal);
     for (const step of journal.steps) {
       if (step.done) continue;
       const path = step.kind === 'bundles' ? paths.manifest : paths.patch;
-      const actual = await readOptional(path) ?? '';
+      let actual = await readOptional(path) ?? '';
       if (actual !== step.before && actual !== step.after) throw new Error('concurrent profile edit; migration paused without overwrite');
       await options.checkpoint?.('before-' + step.kind);
+      await validateJournalInputs(host, target, journal);
+      actual = await readOptional(path) ?? '';
+      if (actual !== step.before && actual !== step.after) throw new Error('concurrent profile edit; migration paused without overwrite');
       if (actual !== step.after) await writePrivate(path, step.after);
       await options.checkpoint?.('after-' + step.kind);
       step.done = true;
@@ -162,7 +242,9 @@ export async function runMigration(host: NativeMigrationHost, target: Distributi
     journal.phase = 'saved';
     await writePrivate(paths.journal, JSON.stringify(journal) + '\n');
     await options.checkpoint?.('after-saved');
-    const report = reportJournal(host, journal, await inspectMigration(host, target));
+    const current = await inspectMigration(host, target);
+    await observeOwners(host, journal, current);
+    const report = reportJournal(host, journal, current);
     await writePrivate(join(paths.root, target.rowId + '.report.json'), JSON.stringify(report, null, 2) + '\n');
     return report;
   });
@@ -170,6 +252,7 @@ export async function runMigration(host: NativeMigrationHost, target: Distributi
 async function finishRecovery(host: NativeMigrationHost, target: Distribution, journal: Journal): Promise<void> {
   const paths = await profilePaths(host, target.rowId);
   const writes = journal.recoveryWrites!;
+  if (Object.entries(journal.rollback ?? {}).some(([id, state]) => state?.done && hasLiveOwners(journal, id as ModuleId))) throw new Error('current target owner has not stopped; recovery replay refused');
   for (const [path, before, after] of [[paths.patch, writes.patchBefore, writes.patchAfter], [paths.manifest, writes.manifestBefore, writes.manifestAfter]]) {
     const current = await readOptional(path) ?? '';
     if (current !== before && current !== after) throw new Error('newer edit prevents recovery replay');
@@ -190,6 +273,8 @@ export async function rollbackMigration(host: NativeMigrationHost, target: Distr
     const input = await inspectMigration(host, target);
     if (!journal || journal.operationId !== options.operationId || journal.profileId !== input.profileId) throw new Error('unknown migration operation for this profile');
     if (journal.phase !== 'saved') throw new Error('finish or explicitly repair interrupted migration before selective rollback');
+    if (journal.ownershipVersion !== 1) throw new Error('journal has no complete target owner registry; recovery refused');
+    await observeOwners(host, journal, input);
     if (journal.recoveryWrites) { await finishRecovery(host, target, journal); return reportJournal(host, journal); }
     const paths = await profilePaths(host, target.rowId);
     const doc = document(input.patchText);
@@ -203,9 +288,9 @@ export async function rollbackMigration(host: NativeMigrationHost, target: Distr
       const expected = pending ? { ...decision.config, enabled: false } : decision.config;
       if (!pending?.done && !isDeepStrictEqual(values[id], expected)) throw new Error('newer module edit prevents rollback');
       if (!pending) {
-        journal.rollback[id] = { origin: journal.origin, done: false };
+        journal.rollback[id] = { origin: (journal.owners?.[id] ?? []).includes(processOrigin()) ? processOrigin() : '', done: false };
         values[id] = { ...decision.config, enabled: false };
-      } else if (!pending.done && journal.runtimeObserved && originExited(pending.origin)) {
+      } else if (!pending.done && !hasLiveOwners(journal, id)) {
         // Only remove this operation's literal disabled override, preserving any later rows.
         if (decision.source?.rowId) {
           const rows = doc.contents!.items;

@@ -271,6 +271,8 @@ export async function inspectMigration(host: NativeMigrationHost, target: Distri
     files: [...texts].sort(([a], [b]) => a.localeCompare(b)), overlays: launcherPatches,
     target: { rowId: target.rowId, packageName: target.packageName, moduleIds: target.moduleIds }, startupOwner: host.startupOwner ?? null,
   })).digest('hex');
+  const inputFiles = [...texts].map(([path, value]) => ({ path, hash: value === null ? null : createHash('sha256').update(value).digest('hex') }));
+  const environmentIdentity = createHash('sha256').update(JSON.stringify({ profileId, installAnchor: profile.installAnchor, home: profile.home, overlays: launcherPatches, startupOwner: host.startupOwner ?? null, target: { rowId: target.rowId, packageName: target.packageName, moduleIds: target.moduleIds } })).digest('hex');
   return { profileId, profile, revision, manifest, patchText, manifestText, rows, sources, target, explicit, peers,
-    problems, legacyMode: sources.length > 0, moduleProblems };
+    problems, legacyMode: sources.length > 0, moduleProblems, inputFiles, environmentIdentity };
 }

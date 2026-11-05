@@ -1,4 +1,5 @@
 import type { Decision, Discovery, MigrationPlan, ModuleId, Values } from './types.ts';
+import { validateModuleConfig } from './validation.ts';
 
 export const LEGACY_PACKAGES: Record<ModuleId, string> = {
   context: 'dsh-tool-compact-context', retry: 'dsh-stream-retry', chime: 'dsh-session-chime', goalWait: 'dsh-goal-wait-gate',
@@ -23,19 +24,8 @@ export function isRecord(value: unknown): value is Values { return !!value && ty
 export function containsExpression(value: unknown): boolean {
   return isRecord(value) ? Object.entries(value).some(([key, child]) => key === '__jsExpr' || containsExpression(child)) : Array.isArray(value) && value.some(containsExpression);
 }
-/** Conservative baseline field validation also protects standalone recovery/CLI calls. */
-export function validateKnownConfig(id: ModuleId, config: Values): void {
-  const defaults: Values = { ...LEGACY_DEFAULTS[id], enabled: true };
-  for (const [key, value] of Object.entries(config)) {
-    const expected = defaults[key];
-    if (!Object.hasOwn(defaults, key)) throw new Error('unknown module field');
-    if (Array.isArray(expected)) { if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) throw new Error('invalid string list'); }
-    else if (isRecord(expected)) { if (!isRecord(value) || Object.values(value).some(item => typeof item !== 'number' || !Number.isFinite(item) || item < 0)) throw new Error('invalid timeout map'); }
-    else if (typeof value !== typeof expected) throw new Error('invalid module field type');
-    if (typeof value === 'number' && (!Number.isFinite(value) || value < 0)) throw new Error('invalid nonnegative number');
-    if (['notifyAtRatio', 'volume'].includes(key) && Number(value) > 1) throw new Error('invalid ratio');
-  }
-}
+/** Mandatory full semantic admission for engine, planner and standalone CLI. */
+export function validateKnownConfig(id: ModuleId, config: Values): void { validateModuleConfig(id, config); }
 /** The planner cannot mutate source documents or start a legacy plugin. */
 export function planMigration(input: Discovery): MigrationPlan {
   const decisions: Decision[] = input.target.moduleIds.map(moduleId => {
@@ -48,6 +38,7 @@ export function planMigration(input: Discovery): MigrationPlan {
     const source = sources[0];
     if (source?.problem) return conflict(source.problem);
     const explicit = input.explicit[moduleId] ?? {};
+    try { validateKnownConfig(moduleId, explicit); if (source) { validateKnownConfig(moduleId, source.raw); validateKnownConfig(moduleId, source.effective); } } catch { return conflict('target or legacy schema validation failed'); }
     if (containsExpression(explicit) || source && (containsExpression(source.raw) || containsExpression(source.effective))) return conflict('dynamic configuration is not imported');
     if (!source) {
       const enabled = Object.hasOwn(explicit, 'enabled') ? explicit.enabled === true : !input.legacyMode;

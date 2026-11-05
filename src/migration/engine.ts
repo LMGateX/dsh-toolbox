@@ -1,5 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
+import { realpath } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import type { NativeDiscoveryFacade } from './discovery.ts';
 import { isDeepStrictEqual } from 'node:util';
 import { isMap, isSeq, parseDocument } from 'yaml';
 import { inspectMigration } from './discovery.ts';
@@ -9,7 +13,8 @@ import type { Decision, Discovery, Distribution, MigrationPlan, MigrationReport,
 
 interface Step { kind: 'target' | 'disable' | 'bundles'; before: string; after: string; done: boolean }
 interface JournalEnvironment { identity: string; files: { path: string; hash: string | null }[]; paths: string[] }
-interface Journal { environment?: JournalEnvironment; ownershipVersion?: 1; owners?: Partial<Record<ModuleId, string[]>>; schemaVersion: 1; operationId: string; profileId: string; targetRowId: string; runtimeObserved?: boolean; browserFenceFinalized?: boolean; browserReloadAfter?: number; origin: string; phase: 'prepared' | 'saved'; plan: MigrationPlan; steps: Step[]; backup: string; previous: Partial<Record<ModuleId, unknown>>; rollback?: Partial<Record<ModuleId, { origin: string; done: boolean }>>; recoveryWrites?: { patchBefore: string; patchAfter: string; manifestBefore: string; manifestAfter: string } }
+interface RollbackEvidence { packageDir?: string; files?: { path: string; hash: string }[]; patchPaths?: string[]; problem?: string }
+interface Journal { rollbackEvidence?: Partial<Record<ModuleId, RollbackEvidence>>; environment?: JournalEnvironment; ownershipVersion?: 1; owners?: Partial<Record<ModuleId, string[]>>; schemaVersion: 1; operationId: string; profileId: string; targetRowId: string; runtimeObserved?: boolean; browserFenceFinalized?: boolean; browserReloadAfter?: number; origin: string; phase: 'prepared' | 'saved'; plan: MigrationPlan; steps: Step[]; backup: string; previous: Partial<Record<ModuleId, unknown>>; rollback?: Partial<Record<ModuleId, { origin: string; done: boolean; conflict?: string }>>; recoveryWrites?: { patchBefore: string; patchAfter: string; manifestBefore: string; manifestAfter: string; restoreModules?: ModuleId[] } }
 /** Stable across HMR but different after a genuine process restart, without process-global state. */
 const processOrigin = () => process.pid + ':' + performance.timeOrigin;
 const document = (text: string) => {
@@ -171,6 +176,7 @@ export function reportJournal(host: NativeMigrationHost, journal: Journal, curre
   for (const decision of journal.plan.decisions) {
     const id = decision.moduleId;
     if (journal.recoveryWrites) { modules[id] = { phase: 'prepared', ready: false, enabled: false, reason: 'recovery write replay requires explicit retry' }; continue; }
+    if (journal.rollback?.[id]?.conflict) { modules[id] = { phase: 'conflict', enabled: false, ready: false, reason: journal.rollback[id]!.conflict }; continue; }
     if (journal.rollback?.[id]) { modules[id] = { phase: journal.rollback[id]!.done ? 'rolled-back' : 'restart-required', enabled: false, ready: false, reason: journal.rollback[id]!.done ? 'selectively restored legacy settings' : 'restart host, then repeat rollback to restore old ownership' }; continue; }
     const enabled = current?.explicit[id]?.enabled === undefined ? decision.enabled : current.explicit[id]!.enabled === true;
     if (current?.peers[id]?.length || current?.moduleProblems?.[id]?.length || current?.sources.some(source => source.moduleId === id && !!source.problem) || current?.problems.length) { modules[id] = { phase: 'conflict', ready: false, enabled, reason: 'current profile ownership changed; inspect before retry' }; continue; }
@@ -216,7 +222,7 @@ export async function runMigration(host: NativeMigrationHost, target: Distributi
       const operationId = randomUUID();
       const rendered = renderSteps(input, plan, operationId);
       const backup = join(paths.root, operationId + '.backup.json');
-      journal = { schemaVersion: 1, operationId, profileId: input.profileId, targetRowId: target.rowId, runtimeObserved: [...host.loader.entries()].some(entry => entry.options.id === target.rowId && !!entry.fiber), browserReloadAfter: plan.decisions.some(d => d.moduleId === 'chime' && d.source && d.phase === 'prepared') ? Date.now() : undefined, origin: processOrigin(), phase: 'prepared', environment: journalEnvironment(input), ownershipVersion: 1, owners: {}, plan: { ...plan, target: { ...target, validateModule: undefined } }, steps: rendered.steps, previous: rendered.previous, backup };
+      journal = { schemaVersion: 1, operationId, profileId: input.profileId, targetRowId: target.rowId, runtimeObserved: [...host.loader.entries()].some(entry => entry.options.id === target.rowId && !!entry.fiber), browserReloadAfter: plan.decisions.some(d => d.moduleId === 'chime' && d.source && d.phase === 'prepared') ? Date.now() : undefined, origin: processOrigin(), phase: 'prepared', environment: journalEnvironment(input), rollbackEvidence: await captureRollbackEvidence(host, plan), ownershipVersion: 1, owners: {}, plan: { ...plan, target: { ...target, validateModule: undefined } }, steps: rendered.steps, previous: rendered.previous, backup };
       await options.checkpoint?.('before-backup');
       await writePrivate(backup, JSON.stringify({ schemaVersion: 1, profileId: input.profileId, manifest: input.manifestText, patch: input.patchText }) + '\n');
       await options.checkpoint?.('after-backup');
@@ -249,11 +255,201 @@ export async function runMigration(host: NativeMigrationHost, target: Distributi
     return report;
   });
 }
-async function finishRecovery(host: NativeMigrationHost, target: Distribution, journal: Journal): Promise<void> {
-  const paths = await profilePaths(host, target.rowId);
+
+const PEER_MODULES: Record<string, readonly ModuleId[]> = {
+  'dsh-toolbox': ['context', 'retry', 'chime', 'goalWait'],
+  'dsh-toolbox-context': ['context'], 'dsh-toolbox-retry': ['retry'],
+  'dsh-toolbox-chime': ['chime'], 'dsh-toolbox-goal-wait': ['goalWait'],
+};
+async function rollbackNative(host: NativeMigrationHost): Promise<NativeDiscoveryFacade> {
+  return host.nativeMigration ?? await import(pathToFileURL(createRequire(host.profileContext.installAnchor).resolve('@deepseek-ai/dsh-app-boot')).href) as NativeDiscoveryFacade;
+}
+async function sourcePackage(host: NativeMigrationHost, decision: Decision, native: NativeDiscoveryFacade) {
+  const source = decision.source!;
+  const specifier = source.bundleName ?? source.moduleName ?? source.packageName;
+  let dir: string;
+  if (specifier.startsWith('file:') || isAbsolute(specifier)) {
+    dir = dirname(specifier.startsWith('file:') ? fileURLToPath(specifier) : specifier);
+    while (await readOptional(join(dir, 'package.json')) === null) {
+      if (dirname(dir) === dir) throw new Error('source package unavailable');
+      dir = dirname(dir);
+    }
+  } else {
+    const name = specifier.startsWith('@') ? specifier.split('/').slice(0, 2).join('/') : specifier.split('/')[0]!;
+    dir = native.resolveBundleDir('dsh-toolbox rollback', name, host.profileContext.installAnchor, host.profileContext.dir);
+  }
+  dir = await realpath(dir);
+  const path = join(dir, 'package.json');
+  const manifest = JSON.parse(await readOptional(path) ?? 'null') as Values | null;
+  if (!manifest || manifest.name !== source.packageName || manifest.version !== source.version) throw new Error('source package identity or version changed');
+  return { dir, path, manifest };
+}
+async function captureRollbackEvidence(host: NativeMigrationHost, plan: MigrationPlan): Promise<Partial<Record<ModuleId, RollbackEvidence>>> {
+  const result: Partial<Record<ModuleId, RollbackEvidence>> = {};
+  const native = await rollbackNative(host);
+  for (const decision of plan.decisions) if (decision.source && decision.phase !== 'conflict') {
+    try {
+      const info = await sourcePackage(host, decision, native);
+      const bundle = isRecord(info.manifest.dsh) && isRecord(info.manifest.dsh.bundle) ? info.manifest.dsh.bundle : undefined;
+      const declared = typeof bundle?.patch === 'string' ? [bundle.patch] : bundle?.patch ?? [];
+      if (!Array.isArray(declared) || declared.some(value => typeof value !== 'string')) throw new Error('source bundle paths unavailable');
+      const patchPaths = await Promise.all(declared.map(value => realpath(join(info.dir, value as string))));
+      const files = [];
+      for (const path of [info.path, ...patchPaths]) {
+        const text = await readOptional(path); if (text === null) throw new Error('source layer unavailable');
+        files.push({ path, hash: digest(text) });
+      }
+      result[decision.moduleId] = { packageDir: info.dir, files, patchPaths };
+    } catch { result[decision.moduleId] = { problem: 'original source provenance could not be recorded; automatic restoration refused' }; }
+  }
+  return result;
+}
+function ownedMarker(journal: Journal, id: ModuleId): string { return 'dsh-toolbox-migration:' + journal.operationId + ':' + id; }
+function sourceRows(rows: unknown[], ancestors: string[] = []): { row: Values; ancestors: string[] }[] {
+  return rows.flatMap(row => !isRecord(row) ? [] : [{ row, ancestors }, ...(row.group === true || row.name === 'cordis:group') && Array.isArray(row.config) ? sourceRows(row.config, [...ancestors, String(row.id ?? '')]) : []]);
+}
+async function peerJournalConflict(host: NativeMigrationHost, target: Distribution, id: ModuleId, profileId: string): Promise<string | undefined> {
+  for (const [rowId, ids] of Object.entries(PEER_MODULES)) {
+    if (rowId === target.rowId || !ids.includes(id)) continue;
+    const paths = await profilePaths(host, rowId), text = await readOptional(paths.journal);
+    if (text === null) continue;
+    try {
+      const peer = JSON.parse(text) as Journal;
+      if (peer.schemaVersion !== 1 || peer.profileId !== profileId || peer.targetRowId !== rowId) return 'peer distribution ownership journal is ambiguous';
+      if (peer.ownershipVersion !== 1 && peer.runtimeObserved && !originExited(peer.origin)) return 'peer distribution runtime ownership cannot be verified';
+      const owners = peer.owners?.[id] ?? [];
+      if (!Array.isArray(owners) || owners.some(origin => typeof origin !== 'string' || !originExited(origin))) return 'another profile host still owns this module through a peer distribution';
+    } catch { return 'peer distribution ownership journal cannot be verified'; }
+  }
+  return undefined;
+}
+/** Inspect a fresh module ownership boundary; unrelated package/profile edits are allowed. */
+async function rollbackConflict(host: NativeMigrationHost, target: Distribution, journal: Journal, decision: Decision, current: Discovery): Promise<string | undefined> {
+  const id = decision.moduleId, source = decision.source;
+  if (current.problems.length) return 'profile discovery is ambiguous; legacy restoration refused';
+  if (current.moduleProblems?.[id]?.length) return current.moduleProblems[id]!.join('; ');
+  if (current.peers[id]?.length) return 'another selected Toolbox distribution owns this module';
+  for (const entry of host.loader.entries()) {
+    const options = entry.options;
+    if (options.id === target.rowId && options.name === (target.packageName ?? target.rowId)) continue;
+    const ids = PEER_MODULES[options.name] ?? PEER_MODULES[options.id];
+    if (ids?.includes(id) && entry.fiber && (entry.fiber.state !== undefined || entry.fiber.inertia)) return 'another live Toolbox distribution owns this module';
+  }
+  const remotePeer = await peerJournalConflict(host, target, id, current.profileId);
+  if (remotePeer) return remotePeer;
+  if (!source) return undefined;
+  const candidates = current.sources.filter(value => value.moduleId === id);
+  if (candidates.length !== 1 || candidates[0]!.problem) return 'current legacy source is ambiguous or unsupported';
+  if (candidates[0]!.packageName !== source.packageName || candidates[0]!.version !== source.version) return 'legacy package identity or version changed';
+  const evidence = journal.rollbackEvidence?.[id];
+  if (!evidence?.packageDir || !evidence.files || !evidence.patchPaths) return evidence?.problem ?? 'journal lacks per-module source provenance; restoration refused';
+  try {
+    const native = await rollbackNative(host), info = await sourcePackage(host, decision, native);
+    if (info.dir !== evidence.packageDir) return 'legacy source resolution changed';
+    for (const file of evidence.files) {
+      const text = await readOptional(file.path);
+      if (text === null || digest(text) !== file.hash) return 'legacy source package or bundle configuration changed';
+    }
+    const profile = native.loadOverlayPatches('dsh-toolbox rollback', current.profile.patchPath);
+    const homePath = join(current.profile.home, 'cordis.patch.yml');
+    const home = await readOptional(homePath) === null ? [] : native.loadOverlayPatches('dsh-toolbox rollback', homePath);
+    const higher = [...home, ...current.profile.overlays ?? []];
+    let base: unknown[] = current.rows;
+    if (source.bundleSelected) {
+      const patches = evidence.patchPaths.flatMap(path => native.loadOverlayPatches('dsh-toolbox rollback', path));
+      base = native.composeEntries([patches, profile]);
+    }
+    const matches = sourceRows(base).filter(value => value.row.id === source.rowId && value.row.name === (source.moduleName ?? source.packageName));
+    if (source.rowId && matches.length !== 1) return 'legacy source row identity or instance count changed';
+    const ids = new Set([source.rowId, ...matches.flatMap(value => value.ancestors)]);
+    if (higher.some(value => isRecord(value) && (ids.has(String(value.id ?? '')) || Array.isArray(value.insert) && sourceRows(value.insert).some(child => ids.has(String(child.row.id ?? '')))))) return 'higher-priority HOME or launcher overlay controls the legacy source';
+    const config = source.rowId ? matches[0]!.row.config ?? {} : candidates[0]!.effective;
+    if (!isRecord(config) || containsExpression(config)) return 'legacy source configuration is dynamic or malformed';
+    validateKnownConfig(id, config);
+    if (!isDeepStrictEqual(config, source.effective)) return 'legacy source configuration changed after migration';
+  } catch { return 'legacy source provenance or configuration could not be verified'; }
+  return undefined;
+}
+
+function markerIndex(doc: ReturnType<typeof document>, journal: Journal, decision: Decision): number {
+  const source = decision.source;
+  if (!source?.rowId) return -1;
+  return doc.contents.items.findLastIndex((row, i) => isMap(row) && row.commentBefore === ownedMarker(journal, decision.moduleId) && row.items.length === 3 &&
+    doc.getIn([i, 'id']) === source.rowId && doc.getIn([i, 'name']) === (source.moduleName ?? source.packageName) && doc.getIn([i, 'disabled']) === true);
+}
+function restoreIntent(journal: Journal): ModuleId[] {
   const writes = journal.recoveryWrites!;
-  if (Object.entries(journal.rollback ?? {}).some(([id, state]) => state?.done && hasLiveOwners(journal, id as ModuleId))) throw new Error('current target owner has not stopped; recovery replay refused');
+  if (writes.restoreModules) return writes.restoreModules;
+  // Older recovery intents have no explicit module list. Infer only the owned enabling deltas.
+  const before = document(writes.patchBefore), after = document(writes.patchAfter);
+  const bundles = (text: string): string[] => JSON.parse(text).dsh?.profile?.bundles ?? [];
+  const beforeBundles = bundles(writes.manifestBefore), afterBundles = bundles(writes.manifestAfter);
+  return journal.plan.decisions.filter(decision => journal.rollback?.[decision.moduleId]?.done &&
+    (markerIndex(before, journal, decision) >= 0 && markerIndex(after, journal, decision) < 0 ||
+      decision.source?.bundleSelected && !beforeBundles.includes(decision.source.bundleName ?? decision.source.packageName) && afterBundles.includes(decision.source.bundleName ?? decision.source.packageName)))
+    .map(decision => decision.moduleId);
+}
+/** Rebase only exact owned restore deltas; never replay an old whole-profile enabling image. */
+async function rebaseRecovery(host: NativeMigrationHost, target: Distribution, journal: Journal, ids: ModuleId[]): Promise<void> {
+  const current = await inspectMigration(host, target), old = journal.recoveryWrites!;
+  const doc = document(current.patchText), manifest = structuredClone(current.manifest);
+  const { config } = targetConfig(doc, target, {});
+  const modules = isRecord(config.modules) ? config.modules : {};
+  const dsh = isRecord(manifest.dsh) ? manifest.dsh : {}, profile = isRecord(dsh.profile) ? dsh.profile : {};
+  let bundles = Array.isArray(profile.bundles) ? [...profile.bundles] : [];
+  for (const id of ids) {
+    const decision = journal.plan.decisions.find(value => value.moduleId === id);
+    if (!decision?.config || !journal.rollback?.[id]) throw new Error('unrecognized recovery restore intent');
+    if (!isDeepStrictEqual(modules[id], { ...decision.config, enabled: false })) throw new Error('newer module edit prevents recovery replay');
+    const state = journal.rollback[id]!;
+    const conflict = hasLiveOwners(journal, id) ? 'current target runtime owner has not stopped; restoration refused' : await rollbackConflict(host, target, journal, decision, current);
+    const matching = markerIndex(doc, journal, decision), source = decision.source;
+    if (conflict) {
+      state.done = false; state.conflict = conflict;
+      if (source?.rowId && matching < 0) {
+        // A crash may have removed our marker before enabling its bundle. Restore that exact
+        // owned disable operation, but do not guess after an unrelated patch edit.
+        if (current.patchText !== old.patchAfter) throw new Error('legacy override changed during recovery; restoration refused');
+        const row = doc.createNode({ id: source.rowId, name: source.moduleName ?? source.packageName, disabled: true });
+        row.commentBefore = ownedMarker(journal, id); doc.add(row);
+      }
+      if (source?.bundleSelected) bundles = bundles.filter(name => name !== (source.bundleName ?? source.packageName));
+      continue;
+    }
+    delete state.conflict;
+    if (source?.rowId) {
+      if (matching >= 0) doc.deleteIn([matching]);
+      else if (current.patchText !== old.patchAfter) throw new Error('legacy override changed during recovery; restoration refused');
+    }
+    if (source?.bundleSelected && !bundles.includes(source.bundleName ?? source.packageName)) bundles.push(source.bundleName ?? source.packageName);
+    state.done = true;
+  }
+  config.modules = modules;
+  // Marker deletion shifts indices; resolve the existing target override again.
+  doc.setIn([targetIndex(doc, target), 'config'], config);
+  profile.bundles = bundles; dsh.profile = profile; manifest.dsh = dsh;
+  journal.recoveryWrites = { patchBefore: current.patchText, patchAfter: String(doc), manifestBefore: current.manifestText,
+    manifestAfter: JSON.stringify(manifest, null, 2) + '\n', restoreModules: ids };
+  const paths = await profilePaths(host, target.rowId);
+  await writePrivate(paths.journal, JSON.stringify(journal) + '\n');
+}
+async function finishRecovery(host: NativeMigrationHost, target: Distribution, journal: Journal, attempt = 0): Promise<void> {
+  const paths = await profilePaths(host, target.rowId), ids = restoreIntent(journal);
+  if (ids.length) await rebaseRecovery(host, target, journal, ids);
+  const writes = journal.recoveryWrites!;
   for (const [path, before, after] of [[paths.patch, writes.patchBefore, writes.patchAfter], [paths.manifest, writes.manifestBefore, writes.manifestAfter]]) {
+    if (ids.length) {
+      const fresh = await inspectMigration(host, target);
+      let changed = false;
+      for (const id of ids) if (journal.rollback?.[id]?.done) {
+        const decision = journal.plan.decisions.find(value => value.moduleId === id)!;
+        if (hasLiveOwners(journal, id) || await rollbackConflict(host, target, journal, decision, fresh)) changed = true;
+      }
+      if (changed) {
+        if (attempt >= 2) throw new Error('ownership changed repeatedly during recovery; restore refused');
+        return finishRecovery(host, target, journal, attempt + 1);
+      }
+    }
     const current = await readOptional(path) ?? '';
     if (current !== before && current !== after) throw new Error('newer edit prevents recovery replay');
     if (current !== after) await writePrivate(path, after);
@@ -290,7 +486,14 @@ export async function rollbackMigration(host: NativeMigrationHost, target: Distr
       if (!pending) {
         journal.rollback[id] = { origin: (journal.owners?.[id] ?? []).includes(processOrigin()) ? processOrigin() : '', done: false };
         values[id] = { ...decision.config, enabled: false };
-      } else if (!pending.done && !hasLiveOwners(journal, id)) {
+      }
+      const state = journal.rollback[id]!;
+      if (!state.done) {
+        const conflict = await rollbackConflict(host, target, journal, decision, input);
+        if (conflict) { state.conflict = conflict; continue; }
+        delete state.conflict;
+      }
+      if (pending && !pending.done && !hasLiveOwners(journal, id)) {
         // Only remove this operation's literal disabled override, preserving any later rows.
         if (decision.source?.rowId) {
           const rows = doc.contents!.items;
@@ -314,7 +517,7 @@ export async function rollbackMigration(host: NativeMigrationHost, target: Distr
       if (journal.rollback[id]?.done && decision?.source?.bundleSelected && !bundles.includes(decision.source.bundleName ?? decision.source.packageName)) bundles.push(decision.source.bundleName ?? decision.source.packageName);
     }
     profile.bundles = bundles; dsh.profile = profile; manifest.dsh = dsh;
-    journal.recoveryWrites = { patchBefore: input.patchText, patchAfter: String(doc), manifestBefore, manifestAfter: JSON.stringify(manifest, null, 2) + '\n' };
+    journal.recoveryWrites = { patchBefore: input.patchText, patchAfter: String(doc), manifestBefore, manifestAfter: JSON.stringify(manifest, null, 2) + '\n', restoreModules: options.modules.filter(id => journal.rollback?.[id]?.done) };
     await writePrivate(paths.journal, JSON.stringify(journal) + '\n');
     await finishRecovery(host, target, journal);
     return reportJournal(host, journal);

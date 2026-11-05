@@ -1,0 +1,38 @@
+name: Publish verified release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated release tag
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Verify exact version tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: node -e "if (process.env.RELEASE_TAG !== 'v' + require('./package.json').version) process.exit(1)"
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install --with-deps chromium
+      - run: npm run check && npm run pack && npm run test:artifacts
+      - name: Verify packaged checksums
+        working-directory: artifacts
+        run: sha256sum --check SHA256SUMS
+      - name: Publish tested assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "DSH Toolbox $RELEASE_TAG" --notes-file "docs/releases/$RELEASE_TAG.md" artifacts/*.tgz artifacts/SHA256SUMS
